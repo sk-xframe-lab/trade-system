@@ -1,0 +1,96 @@
+version: "3.9"
+
+services:
+  # ─────────────────────────────────────────
+  # PostgreSQL: 正本DB（ポジション・注文・監査ログ）
+  # ─────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: trade_db
+      POSTGRES_USER: trade
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trade_secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"        # 既存システムの5432と衝突しないよう5433を使用
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trade -d trade_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────
+  # Redis: 冪等性キー / 分散ロック / レート制限
+  # 正本DBの補助用途のみ。永続データはPostgreSQLに保存
+  # ─────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-redis_secret}
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6380:6379"        # 既存Redisと衝突しないよう6380を使用
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis_secret}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────
+  # trade_app: 自動売買エンジン（FastAPI）
+  # ─────────────────────────────────────────
+  trade_app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://trade:${POSTGRES_PASSWORD:-trade_secret}@postgres:5432/trade_db
+      DATABASE_URL_SYNC: postgresql+psycopg2://trade:${POSTGRES_PASSWORD:-trade_secret}@postgres:5432/trade_db
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379/0
+      API_TOKEN: ${API_TOKEN:-changeme_before_production}
+      BROKER_TYPE: ${BROKER_TYPE:-mock}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DEBUG: ${DEBUG:-false}
+      # 立花証券 API（Phase 4+ で設定）
+      TACHIBANA_BASE_URL: ${TACHIBANA_BASE_URL:-}
+      TACHIBANA_USER_ID: ${TACHIBANA_USER_ID:-}
+      TACHIBANA_PASSWORD: ${TACHIBANA_PASSWORD:-}
+      # リスク設定
+      MAX_POSITION_SIZE_PCT: ${MAX_POSITION_SIZE_PCT:-10.0}
+      MAX_CONCURRENT_POSITIONS: ${MAX_CONCURRENT_POSITIONS:-5}
+      DAILY_LOSS_LIMIT_JPY: ${DAILY_LOSS_LIMIT_JPY:-50000.0}
+      # 管理画面 / Admin DB / OAuth / TOTP
+      ADMIN_DATABASE_URL: postgresql+asyncpg://trade:${POSTGRES_PASSWORD:-trade_secret}@postgres:5432/trade_db
+      ADMIN_DATABASE_URL_SYNC: postgresql+psycopg2://trade:${POSTGRES_PASSWORD:-trade_secret}@postgres:5432/trade_db
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      OAUTH_REDIRECT_URI: ${OAUTH_REDIRECT_URI:-}
+      ADMIN_FRONTEND_ORIGIN: ${ADMIN_FRONTEND_ORIGIN:-http://localhost:5173}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY:-}
+      TOTP_ISSUER: ${TOTP_ISSUER:-TradeSystem Admin}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./trade_app:/app/trade_app:ro   # コード変更を即時反映（開発時）
+      - ./tests:/app/tests:ro           # テストコードも即時反映
+      - trade_logs:/app/logs
+
+volumes:
+  postgres_data:
+  redis_data:
+  trade_logs:

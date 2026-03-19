@@ -1,0 +1,14 @@
+{
+  "p_date": "2026.03.18-08:52:39.740",
+  "p_no": "2",
+  "p_sd_date": "2026.03.18-08:52:39.655",
+  "p_errno": "0",
+  "p_err_msg": "",
+  "sCLMID": "CLMMfdsGetMarketPrice",
+  "aCLMMfdsMarketPrice": [
+    {
+      "473": "9001",
+      "pDPP": ""
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "timestamp": "2026-03-18T01:50:22.130126",
+  "url": "https://demo-kabuka.e-shiten.jp/e_api_v4r8/auth/?{masked}",
+  "p_no": 1,
+  "p_sd_date": "2026.03.18-01:50:22.130",
+  "payload": {
+    "p_no": "1",
+    "p_sd_date": "2026.03.18-01:50:22.130",
+    "sCLMID": "CLMAuthLoginRequest",
+    "sUserId": "kq****",
+    "sPassword": "****"
+  }
+}

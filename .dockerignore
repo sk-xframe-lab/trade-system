@@ -1,0 +1,32 @@
+# 認証情報・シークレット
+.env
+*.env
+
+# Python キャッシュ
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 開発ツール
+.git/
+.github/
+.vscode/
+*.swp
+*.swo
+
+# ログ・データ
+logs/
+demo_logs/
+*.log
+
+# ドキュメント
+docs/
+*.md
+
+# テスト出力
+htmlcov/
+.coverage
+coverage.xml

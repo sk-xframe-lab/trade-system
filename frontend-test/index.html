@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TradeSystem Admin — 接続確認</title>
+  <!-- QR コード生成ライブラリ（CDN）。オフライン環境では otpauth URI テキストにフォールバック -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"
+          onerror="window._qrFailed=true"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 640px;
+      margin: 32px auto;
+      padding: 0 16px;
+      background: #f8f9fa;
+      color: #333;
+    }
+    .card {
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 28px;
+      box-shadow: 0 2px 6px rgba(0,0,0,.08);
+    }
+    h1 { font-size: 1.4rem; margin: 0 0 4px; color: #1a1a2e; }
+    h2 { font-size: 1.2rem; margin: 0 0 16px; color: #1a1a2e; }
+    h3 { font-size: 1rem; margin: 16px 0 8px; }
+    p  { margin: 8px 0; }
+    hr { border: none; border-top: 1px solid #eee; margin: 20px 0; }
+
+    /* ボタン */
+    button {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: #4285f4; color: #fff;
+      border: none; border-radius: 5px;
+      padding: 10px 20px; font-size: 15px;
+      cursor: pointer; margin: 6px 4px 6px 0;
+      transition: background .15s;
+    }
+    button:hover  { background: #357ae8; }
+    button:disabled { background: #aaa; cursor: not-allowed; }
+    button.secondary { background: #5f6368; }
+    button.secondary:hover { background: #444; }
+    button.danger { background: #d93025; }
+    button.danger:hover { background: #b52a1f; }
+
+    /* フォーム */
+    input[type="text"] {
+      font-size: 1.6rem;
+      padding: 8px 12px;
+      border: 1px solid #ccc;
+      border-radius: 5px;
+      width: 140px;
+      text-align: center;
+      letter-spacing: 5px;
+      font-family: monospace;
+    }
+
+    /* ステータス */
+    .st {
+      padding: 10px 14px;
+      border-radius: 5px;
+      margin: 10px 0;
+      font-size: .93rem;
+      line-height: 1.5;
+    }
+    .st.info    { background: #e8f0fe; border-left: 4px solid #4285f4; }
+    .st.success { background: #e6f4ea; border-left: 4px solid #34a853; }
+    .st.error   { background: #fce8e6; border-left: 4px solid #d93025; }
+    .st.warn    { background: #fef7e0; border-left: 4px solid #fbbc04; }
+
+    /* テーブル */
+    table { border-collapse: collapse; width: 100%; font-size: .93rem; }
+    th, td { padding: 7px 12px; border: 1px solid #e0e0e0; text-align: left; }
+    th { background: #f5f5f5; font-weight: 600; width: 38%; }
+
+    /* QR コード */
+    #qr-box { text-align: center; margin: 12px 0; }
+    #qr-box canvas, #qr-box img { border: 8px solid #fff; box-shadow: 0 0 0 1px #ddd; }
+
+    /* コードブロック */
+    pre {
+      background: #f5f5f5;
+      border: 1px solid #e0e0e0;
+      border-radius: 4px;
+      padding: 10px;
+      font-size: .8rem;
+      word-break: break-all;
+      white-space: pre-wrap;
+      margin: 6px 0;
+    }
+    details summary { cursor: pointer; color: #4285f4; font-size: .9rem; margin: 6px 0; }
+
+    /* チェックリスト */
+    .checklist { list-style: none; padding: 0; margin: 8px 0; }
+    .checklist li { padding: 3px 0; }
+    .checklist li::before { margin-right: 6px; }
+    .checklist .ok::before   { content: "✅"; }
+    .checklist .warn::before { content: "⚠"; }
+
+    small { color: #666; }
+    code  { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-size: .88rem; }
+  </style>
+</head>
+<body>
+<div id="app"></div>
+
+<script>
+"use strict";
+
+// ─── 設定 ──────────────────────────────────────────────────────────────────────
+// バックエンド API ベース URL。CORS 許可済み（ADMIN_FRONTEND_ORIGIN=http://localhost:3000）
+const BACKEND = "http://localhost:8000";
+const API     = `${BACKEND}/api/ui-admin`;
+
+// ─── PKCE ヘルパー ─────────────────────────────────────────────────────────────
+function b64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+function randB64url(byteLen) {
+  const a = new Uint8Array(byteLen);
+  crypto.getRandomValues(a);
+  return b64url(a.buffer);
+}
+async function sha256B64url(str) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+  return b64url(buf);
+}
+
+// ─── ルーター ──────────────────────────────────────────────────────────────────
+const app = document.getElementById("app");
+
+function navigate(path) {
+  history.pushState(null, "", path);
+  render();
+}
+
+async function render() {
+  const p = location.pathname;
+  if (p === "/" || p === "/login")       return renderLogin();
+  if (p.startsWith("/auth/callback"))    return renderCallback();
+  if (p === "/totp")                     return renderTotp();
+  if (p === "/me")                       return renderMe();
+  renderLogin();
+}
+
+window.addEventListener("popstate", render);
+
+// ─── UI ヘルパー ───────────────────────────────────────────────────────────────
+function html(strings, ...vals) {
+  return strings.reduce((a, s, i) =>
+    a + s + (vals[i] !== undefined ? String(vals[i]).replace(/</g,"&lt;") : ""), "");
+}
+
+function st(type, msg) {
+  return `<div class="st ${type}">${msg}</div>`;
+}
+
+function setStatus(type, msg, id="status") {
+  const el = document.getElementById(id);
+  if (el) el.outerHTML = `<div id="${id}" class="st ${type}">${msg}</div>`;
+}
+
+// ─── fetch ラッパー ────────────────────────────────────────────────────────────
+async function apiFetch(path, opts = {}) {
+  const defaults = { credentials: "include", headers: {} };
+  if (opts.body) defaults.headers["Content-Type"] = "application/json";
+  const res = await fetch(`${API}${path}`, { ...defaults, ...opts,
+    headers: { ...defaults.headers, ...(opts.headers || {}) }
+  });
+  const data = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+  return { ok: res.ok, status: res.status, data };
+}
+
+// ─── ページ: /login ────────────────────────────────────────────────────────────
+function renderLogin() {
+  app.innerHTML = `
+    <div class="card">
+      <h1>TradeSystem Admin</h1>
+      <p>Google OAuth 実接続確認ツール</p>
+      <hr>
+      <button id="loginBtn">🔐 Google でログイン</button>
+      <div id="status"></div>
+      <hr>
+      <small>バックエンド: <code>${BACKEND}</code> &nbsp;|&nbsp; redirect_uri: <code>http://localhost:3000/auth/callback</code></small>
+    </div>`;
+  document.getElementById("loginBtn").addEventListener("click", startOAuth);
+}
+
+async function startOAuth() {
+  const btn = document.getElementById("loginBtn");
+  btn.disabled = true;
+  setStatus("info", "PKCE パラメータを生成中...");
+  try {
+    const codeVerifier  = randB64url(32);
+    const codeChallenge = await sha256B64url(codeVerifier);
+    const state         = randB64url(16);
+
+    sessionStorage.setItem("oauth_code_verifier", codeVerifier);
+    sessionStorage.setItem("oauth_state", state);
+
+    setStatus("info", "バックエンドから authorization_url を取得中...");
+    const { ok, status, data } = await apiFetch(
+      `/auth/login?code_challenge=${encodeURIComponent(codeChallenge)}&state=${encodeURIComponent(state)}`
+    );
+    if (!ok) {
+      setStatus("error", `<b>エラー ${status}</b>: ${data.detail || JSON.stringify(data)}<br>
+        バックエンドが起動しているか、GOOGLE_CLIENT_ID が設定されているか確認してください。`);
+      btn.disabled = false;
+      return;
+    }
+    setStatus("info", "Google 認証ページへ移動します...");
+    location.href = data.authorization_url;
+  } catch (e) {
+    setStatus("error", `接続エラー: ${e.message}<br><small>バックエンドが起動しているか確認: <code>docker compose up -d</code></small>`);
+    btn.disabled = false;
+  }
+}
+
+// ─── ページ: /auth/callback ───────────────────────────────────────────────────
+async function renderCallback() {
+  app.innerHTML = `<div class="card"><h2>コールバック処理中</h2>
+    <div id="status" class="st info">Google 認証結果を確認しています...</div></div>`;
+
+  const params    = new URLSearchParams(location.search);
+  const code      = params.get("code");
+  const stateP    = params.get("state");
+  const errorP    = params.get("error");
+
+  // Google 側のエラー（ユーザーキャンセル等）
+  if (errorP) {
+    app.innerHTML = `<div class="card"><h2>Google 認証エラー</h2>
+      ${st("error", `Google から <code>error=${errorP}</code> が返されました。`)}
+      <button onclick="navigate('/login')">ログインに戻る</button></div>`;
+    return;
+  }
+
+  if (!code || !stateP) {
+    app.innerHTML = `<div class="card"><h2>パラメータ不足</h2>
+      ${st("error", "URL に <code>code</code> または <code>state</code> が含まれていません。")}
+      <button onclick="navigate('/login')">ログインに戻る</button></div>`;
+    return;
+  }
+
+  // ── state 検証（CSRF 防止） ──
+  const savedState = sessionStorage.getItem("oauth_state");
+  if (!savedState || savedState !== stateP) {
+    sessionStorage.removeItem("oauth_state");
+    sessionStorage.removeItem("oauth_code_verifier");
+    app.innerHTML = `<div class="card"><h2>⚠ セキュリティエラー</h2>
+      ${st("error", `<b>state が一致しません。CSRF 攻撃の可能性があります。</b><br>
+        <code>POST /auth/callback</code> は呼び出しません。<br>
+        期待値: <code>${savedState || "(なし)"}</code><br>
+        受信値: <code>${stateP}</code>`)}
+      <button onclick="navigate('/login')">ログインからやり直す</button></div>`;
+    return;
+  }
+
+  const codeVerifier = sessionStorage.getItem("oauth_code_verifier");
+  sessionStorage.removeItem("oauth_state");
+  sessionStorage.removeItem("oauth_code_verifier");
+
+  // ── バックエンドへ code exchange ──
+  try {
+    const { ok, status, data } = await apiFetch("/auth/callback", {
+      method: "POST",
+      body: JSON.stringify({ code, code_verifier: codeVerifier, state: stateP }),
+    });
+
+    if (!ok) {
+      app.innerHTML = `<div class="card"><h2>認証失敗</h2>
+        ${st("error", `<b>エラー ${status}</b>: ${data.detail || JSON.stringify(data)}<br>
+          <small>T-03/T-04/T-05 を参照（docs/admin/oauth_troubleshoot.md）</small>`)}
+        <button onclick="navigate('/login')">やり直す</button></div>`;
+      return;
+    }
+
+    // session_id を保持（TOTP verify で使用）
+    sessionStorage.setItem("session_id", data.session_id);
+    sessionStorage.setItem("user_email", data.user_email || "");
+
+    app.innerHTML = `<div class="card">
+      <h2>✅ OAuth 認証成功</h2>
+      ${st("success", `<b>Pre-2FA セッション発行済み</b><br>
+        user_email: ${data.user_email}<br>
+        session_id: <code>${data.session_id}</code><br>
+        requires_2fa: ${data.requires_2fa}`)}
+      <p>次は TOTP 設定を行います（初回）または 6桁コードを入力します（2回目以降）。</p>
+      <button onclick="navigate('/totp')">TOTP 設定・確認へ →</button>
+    </div>`;
+  } catch (e) {
+    app.innerHTML = `<div class="card"><h2>接続エラー</h2>
+      ${st("error", e.message)}
+      <button onclick="navigate('/login')">やり直す</button></div>`;
+  }
+}
+
+// ─── ページ: /totp ────────────────────────────────────────────────────────────
+function renderTotp() {
+  const sessionId = sessionStorage.getItem("session_id");
+  const userEmail = sessionStorage.getItem("user_email") || "";
+
+  if (!sessionId) {
+    app.innerHTML = `<div class="card"><h2>TOTP 設定・確認</h2>
+      ${st("error", "session_id がありません。ログインからやり直してください。")}
+      <button onclick="navigate('/login')">ログインに戻る</button></div>`;
+    return;
+  }
+
+  app.innerHTML = `
+    <div class="card">
+      <h2>TOTP 設定・確認</h2>
+      <p>セッション: <code>${sessionId.slice(0,8)}...</code>
+        ${userEmail ? ` &nbsp;(${userEmail})` : ""}</p>
+      <hr>
+
+      <h3>① TOTP セットアップ（初回 / 再設定）</h3>
+      <p>認証アプリ（Google Authenticator 等）でスキャンするための QR コードを生成します。</p>
+      <button id="setupBtn">📱 QR コードを生成</button>
+      <div id="setup-result"></div>
+
+      <hr>
+      <h3>② 6桁コードを入力して確認</h3>
+      <p>認証アプリに表示されたコードを入力してください。</p>
+      <div>
+        <input type="text" id="totp-code" placeholder="000000"
+               maxlength="6" pattern="[0-9]{6}" inputmode="numeric"
+               autocomplete="one-time-code">
+        <button id="verifyBtn">✔ 確認</button>
+      </div>
+      <div id="status"></div>
+    </div>`;
+
+  document.getElementById("setupBtn").addEventListener("click", doTotpSetup);
+  document.getElementById("verifyBtn").addEventListener("click", doTotpVerify);
+  document.getElementById("totp-code").addEventListener("keypress", (e) => {
+    if (e.key === "Enter") doTotpVerify();
+  });
+  // 入力を数字のみに制限
+  document.getElementById("totp-code").addEventListener("input", (e) => {
+    e.target.value = e.target.value.replace(/\D/g, "");
+  });
+}
+
+async function doTotpSetup() {
+  const btn = document.getElementById("setupBtn");
+  btn.disabled = true;
+  btn.textContent = "生成中...";
+  document.getElementById("setup-result").innerHTML = st("info", "TOTP セットアップ中...");
+
+  try {
+    const { ok, status, data } = await apiFetch("/auth/totp/setup", { method: "POST" });
+    if (!ok) {
+      document.getElementById("setup-result").innerHTML =
+        st("error", `<b>エラー ${status}</b>: ${data.detail || JSON.stringify(data)}<br>
+          TOTP_ENCRYPTION_KEY が設定されているか確認してください（503 の場合）。`);
+      btn.disabled = false;
+      btn.textContent = "📱 QR コードを生成";
+      return;
+    }
+
+    const totpUri = data.totp_uri;
+    const resultEl = document.getElementById("setup-result");
+    resultEl.innerHTML = `
+      ${st("success", "TOTP シークレット生成完了。認証アプリでスキャンしてください。")}
+      <div id="qr-box"></div>
+      <details>
+        <summary>otpauth:// URI（テキスト / コピー用）</summary>
+        <pre id="uri-pre"></pre>
+        <button class="secondary" onclick="navigator.clipboard.writeText(document.getElementById('uri-pre').textContent)
+          .then(()=>this.textContent='コピー済み ✔').catch(()=>this.textContent='コピー失敗')">
+          📋 コピー
+        </button>
+      </details>`;
+    document.getElementById("uri-pre").textContent = totpUri;
+
+    // QR コード生成（CDN が使えない場合は fallback）
+    const qrBox = document.getElementById("qr-box");
+    if (typeof QRCode !== "undefined") {
+      try {
+        new QRCode(qrBox, {
+          text: totpUri,
+          width: 200, height: 200,
+          correctLevel: QRCode.CorrectLevel.M,
+        });
+      } catch (_) {
+        qrBox.innerHTML = st("warn", "QR コード描画に失敗しました。上記 URI をアプリに直接入力してください。");
+      }
+    } else {
+      qrBox.innerHTML = st("warn", "QR ライブラリが読み込まれませんでした（オフライン？）。<br>上記 <code>otpauth://</code> URI を認証アプリに直接入力してください。");
+    }
+
+    btn.textContent = "🔄 再生成（上書き）";
+    btn.disabled = false;
+  } catch (e) {
+    document.getElementById("setup-result").innerHTML = st("error", `接続エラー: ${e.message}`);
+    btn.disabled = false;
+    btn.textContent = "📱 QR コードを生成";
+  }
+}
+
+async function doTotpVerify() {
+  const code      = document.getElementById("totp-code").value.trim();
+  const sessionId = sessionStorage.getItem("session_id");
+  const verifyBtn = document.getElementById("verifyBtn");
+
+  if (!code || !/^\d{6}$/.test(code)) {
+    setStatus("error", "6桁の数字を入力してください。");
+    return;
+  }
+  if (!sessionId) {
+    setStatus("error", "session_id がありません。ログインからやり直してください。");
+    return;
+  }
+
+  verifyBtn.disabled = true;
+  setStatus("info", "確認中...");
+
+  try {
+    const { ok, status, data } = await apiFetch("/auth/totp/verify", {
+      method: "POST",
+      body: JSON.stringify({ session_id: sessionId, totp_code: code }),
+    });
+
+    if (!ok) {
+      setStatus("error", `<b>エラー ${status}</b>: ${data.detail || JSON.stringify(data)}<br>
+        <small>30秒待って別のコードで再試行してください（T-09 参照）</small>`);
+      verifyBtn.disabled = false;
+      document.getElementById("totp-code").value = "";
+      document.getElementById("totp-code").focus();
+      return;
+    }
+
+    // セッション昇格成功
+    sessionStorage.removeItem("session_id");
+    navigate("/me");
+  } catch (e) {
+    setStatus("error", `接続エラー: ${e.message}`);
+    verifyBtn.disabled = false;
+  }
+}
+
+// ─── ページ: /me ──────────────────────────────────────────────────────────────
+async function renderMe() {
+  app.innerHTML = `<div class="card"><h2>認証状態確認</h2>
+    <div id="status" class="st info">情報取得中...</div></div>`;
+
+  try {
+    const { ok, status, data } = await apiFetch("/auth/me");
+
+    if (!ok) {
+      app.innerHTML = `<div class="card"><h2>未認証</h2>
+        ${st("error", `<b>エラー ${status}</b>: ${data.detail || JSON.stringify(data)}<br>
+          <small>T-11 参照：verify が完了しているか確認してください。</small>`)}
+        <button onclick="navigate('/login')">ログインに戻る</button></div>`;
+      return;
+    }
+
+    const u = data;
+    const lastLogin = u.last_login_at
+      ? new Date(u.last_login_at).toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" })
+      : "—";
+
+    app.innerHTML = `
+      <div class="card">
+        <h2>✅ 認証完了</h2>
+        ${st("success", "Google OAuth + TOTP 2FA 認証フロー全通過")}
+        <hr>
+        <table>
+          <tr><th>user_id</th><td><small><code>${u.user_id}</code></small></td></tr>
+          <tr><th>email</th><td>${u.email}</td></tr>
+          <tr><th>display_name</th><td>${u.display_name || "—"}</td></tr>
+          <tr><th>role</th><td>${u.role}</td></tr>
+          <tr><th>totp_enabled</th><td>${u.totp_enabled ? "✅ 有効" : "❌ 未設定"}</td></tr>
+          <tr><th>last_login_at</th><td>${lastLogin}</td></tr>
+        </table>
+        <hr>
+        <h3>完了条件チェック</h3>
+        <ul class="checklist">
+          <li class="ok">GET /auth/me が 200 を返した</li>
+          <li class="${u.totp_enabled ? "ok" : "warn"}">totp_enabled: ${u.totp_enabled}</li>
+          <li class="ok">role: ${u.role}</li>
+        </ul>
+        <hr>
+        <button id="refreshBtn">🔄 /auth/me を再呼び出し</button>
+        <button id="logoutBtn" class="danger">🚪 ログアウト</button>
+      </div>`;
+
+    document.getElementById("refreshBtn").addEventListener("click", renderMe);
+    document.getElementById("logoutBtn").addEventListener("click", doLogout);
+  } catch (e) {
+    app.innerHTML = `<div class="card"><h2>接続エラー</h2>
+      ${st("error", e.message)}
+      <button onclick="navigate('/login')">ログインに戻る</button></div>`;
+  }
+}
+
+async function doLogout() {
+  try {
+    const { ok, data } = await apiFetch("/auth/logout", { method: "POST" });
+    app.innerHTML = `
+      <div class="card">
+        <h2>ログアウト${ok ? "完了" : "失敗"}</h2>
+        ${st(ok ? "success" : "error", ok ? data.message : data.detail)}
+        ${ok ? `
+        <p>次に <code>/auth/me</code> を呼んで <b>401</b> になることを確認してください。</p>
+        <button id="checkBtn">🔍 /auth/me を呼ぶ（401 を期待）</button>` : ""}
+        <button class="secondary" onclick="navigate('/login')">ログインページへ</button>
+      </div>`;
+    if (ok) {
+      document.getElementById("checkBtn").addEventListener("click", checkAfterLogout);
+    }
+  } catch (e) {
+    app.innerHTML = `<div class="card"><h2>接続エラー</h2>
+      ${st("error", e.message)}
+      <button onclick="navigate('/login')">ログインに戻る</button></div>`;
+  }
+}
+
+async function checkAfterLogout() {
+  const btn = document.getElementById("checkBtn");
+  btn.disabled = true;
+  const { ok: _ok, status } = await apiFetch("/auth/me").catch(() => ({ status: "?" }));
+  const passed = status === 401;
+  const msg = document.createElement("div");
+  msg.className = `st ${passed ? "success" : "error"}`;
+  msg.innerHTML = passed
+    ? `✅ 期待通り <b>401</b> が返りました — ログアウト成功を確認`
+    : `⚠ 予期しないレスポンス: <b>${status}</b>`;
+  btn.after(msg);
+}
+
+// ─── 初期描画 ─────────────────────────────────────────────────────────────────
+render();
+</script>
+</body>
+</html>
