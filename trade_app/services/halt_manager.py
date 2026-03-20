@@ -85,12 +85,25 @@ class HaltManager:
         """
         # 同一種別の active halt が既に存在するか確認
         result = await db.execute(
-            select(TradingHalt).where(
+            select(TradingHalt)
+            .where(
                 TradingHalt.halt_type == halt_type.value,
                 TradingHalt.is_active == True,  # noqa: E712
             )
+            .order_by(
+                TradingHalt.activated_at.desc(),
+                TradingHalt.id.desc(),
+            )
+            .limit(2)
         )
-        existing = result.scalar_one_or_none()
+        rows = list(result.scalars().all())
+        if len(rows) >= 2:
+            logger.warning(
+                "HaltManager.activate_halt: 少なくとも2件の重複 active halt を検出 "
+                "halt_type=%s — activated_at・id 降順で最新行を使用",
+                halt_type.value,
+            )
+        existing = rows[0] if rows else None
         if existing:
             logger.debug(
                 "HaltManager: %s halt は既にアクティブ id=%s",

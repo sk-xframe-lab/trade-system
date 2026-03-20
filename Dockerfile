@@ -27,4 +27,4 @@ USER trader
 RUN mkdir -p /app/logs
 
 # DB マイグレーション → アプリ起動
-CMD ["sh", "-c", "alembic upgrade head && uvicorn trade_app.main:app --host 0.0.0.0 --port 8000 --workers 2"]
+CMD ["sh", "-c", "alembic upgrade head && uvicorn trade_app.main:app --host 0.0.0.0 --port 8000 --workers 1"]

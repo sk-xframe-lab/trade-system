@@ -113,13 +113,33 @@ class MarketStateRepository:
             active_state_codes: アクティブな state_code リスト
             summary: state_summary_json に格納するサマリー辞書
         """
-        stmt = select(CurrentStateSnapshot).where(
-            CurrentStateSnapshot.layer == layer,
-            CurrentStateSnapshot.target_type == target_type,
-            CurrentStateSnapshot.target_code == target_code,
+        if target_code is None:
+            target_code_cond = CurrentStateSnapshot.target_code.is_(None)
+        else:
+            target_code_cond = CurrentStateSnapshot.target_code == target_code
+
+        stmt = (
+            select(CurrentStateSnapshot)
+            .where(
+                CurrentStateSnapshot.layer == layer,
+                CurrentStateSnapshot.target_type == target_type,
+                target_code_cond,
+            )
+            .order_by(
+                CurrentStateSnapshot.updated_at.desc(),
+                CurrentStateSnapshot.id.desc(),
+            )
+            .limit(2)
         )
         result = await self._db.execute(stmt)
-        snapshot = result.scalar_one_or_none()
+        rows = list(result.scalars().all())
+        if len(rows) >= 2:
+            logger.warning(
+                "MarketStateRepository.upsert_snapshot: 少なくとも2件の重複行を検出 "
+                "layer=%s target_type=%s target_code=%s — updated_at・id 降順で最新行を使用",
+                layer, target_type, target_code,
+            )
+        snapshot = rows[0] if rows else None
 
         now = datetime.now(timezone.utc)
 
@@ -207,13 +227,28 @@ class MarketStateRepository:
         Returns:
             CurrentStateSnapshot または None（データなし）
         """
-        stmt = select(CurrentStateSnapshot).where(
-            CurrentStateSnapshot.layer == "symbol",
-            CurrentStateSnapshot.target_type == "symbol",
-            CurrentStateSnapshot.target_code == ticker,
+        stmt = (
+            select(CurrentStateSnapshot)
+            .where(
+                CurrentStateSnapshot.layer == "symbol",
+                CurrentStateSnapshot.target_type == "symbol",
+                CurrentStateSnapshot.target_code == ticker,
+            )
+            .order_by(
+                CurrentStateSnapshot.updated_at.desc(),
+                CurrentStateSnapshot.id.desc(),
+            )
+            .limit(2)
         )
         result = await self._db.execute(stmt)
-        return result.scalar_one_or_none()
+        rows = list(result.scalars().all())
+        if len(rows) >= 2:
+            logger.warning(
+                "MarketStateRepository.get_symbol_snapshot: 少なくとも2件の重複行を検出 "
+                "ticker=%s — updated_at・id 降順で最新行を使用",
+                ticker,
+            )
+        return rows[0] if rows else None
 
     async def get_symbol_active_evaluations(
         self, ticker: str

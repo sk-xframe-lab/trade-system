@@ -111,8 +111,20 @@ class DecisionRepository:
         else:
             stmt = stmt.where(CurrentStrategyDecision.ticker == ticker)
 
+        stmt = stmt.order_by(
+            CurrentStrategyDecision.updated_at.desc(),
+            CurrentStrategyDecision.id.desc(),
+        ).limit(2)
+
         result = await self._db.execute(stmt)
-        return result.scalar_one_or_none()
+        rows = list(result.scalars().all())
+        if len(rows) >= 2:
+            logger.warning(
+                "DecisionRepository._find_existing: 少なくとも2件の重複行を検出 "
+                "strategy_id=%s ticker=%s — updated_at・id 降順で最新行を使用",
+                strategy_id, ticker,
+            )
+        return rows[0] if rows else None
 
     # ─── 取得 ─────────────────────────────────────────────────────────────
 
