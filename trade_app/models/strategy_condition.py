@@ -31,7 +31,7 @@ class StrategyCondition(Base):
 
     # ─── 所属 strategy ────────────────────────────────────────────────────
     strategy_id: Mapped[str] = mapped_column(
-        String(36),
+        UUID(as_uuid=False),
         ForeignKey("strategy_definitions.id", ondelete="CASCADE"),
         nullable=False,
     )

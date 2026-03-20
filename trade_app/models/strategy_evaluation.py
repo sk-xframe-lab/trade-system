@@ -25,7 +25,7 @@ class StrategyEvaluation(Base):
 
     # ─── 対象 ─────────────────────────────────────────────────────────────
     # strategy_definitions.id への論理参照（FK 制約なし: ログテーブル）
-    strategy_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False)
     # 銘柄コード。None = 銘柄横断評価（market + time_window のみ）
     ticker: Mapped[str | None] = mapped_column(String(64), nullable=True)
 

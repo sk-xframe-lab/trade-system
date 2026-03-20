@@ -33,7 +33,7 @@ class CurrentStrategyDecision(Base):
 
     # ─── 対象 ─────────────────────────────────────────────────────────────
     # strategy_definitions.id への論理参照
-    strategy_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False)
     # 非正規化: strategy_code を重複保持（JOIN 不要にするため）
     strategy_code: Mapped[str] = mapped_column(String(64), nullable=False)
     # 銘柄コード。None = 銘柄横断評価（market + time_window のみ）
