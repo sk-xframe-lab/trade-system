@@ -18,7 +18,7 @@ Phase 3 で追加されたクローズフロー:
 import logging
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from trade_app.models.enums import (
@@ -141,12 +141,12 @@ class PositionManager:
         exit_reason: ExitReason,
         broker,
         triggered_by: str = "watcher",
-    ) -> Order:
+    ) -> "Order | None":
         """
         ExitWatcher が呼び出す。exit注文を発行し、ポジションを CLOSING 状態に遷移させる。
 
         フロー:
-          1. position.status = CLOSING + exit_reason を設定
+          1. Atomic UPDATE: status='OPEN' の行のみ CLOSING に遷移（競合時は None を返す）
           2. PositionExitTransition を OPEN→CLOSING で記録
           3. 逆方向の exit 注文（成行）を作成・ブローカーへ送信
           4. exit Order を DB に保存（position_id FK + is_exit_order=True）
@@ -158,10 +158,10 @@ class PositionManager:
             triggered_by: 操作者識別（watcher / manual）
 
         Returns:
-            送信した exit Order
+            送信した exit Order。CLOSING への遷移が競合した場合は None。
 
         Raises:
-            ValueError: position が OPEN 状態でない場合
+            ValueError: position が OPEN 状態でない場合（事前チェック）
         """
         if position.status != PositionStatus.OPEN.value:
             raise ValueError(
@@ -173,7 +173,31 @@ class PositionManager:
 
         now = datetime.now(timezone.utc)
 
-        # ─── ポジション状態を CLOSING に遷移 ──────────────────────────────
+        # ─── Atomic OPEN→CLOSING 遷移（競合検出）────────────────────────
+        # WHERE status='OPEN' を原子的にチェック＆更新する。
+        # workers >= 2 や非同期 race condition で同一ポジションへの
+        # 二重 initiate_exit を DB レベルで防止する。
+        update_stmt = (
+            update(Position)
+            .where(Position.id == position.id, Position.status == PositionStatus.OPEN.value)
+            .values(
+                status=PositionStatus.CLOSING.value,
+                exit_reason=exit_reason.value,
+                remaining_qty=position.quantity,
+                updated_at=now,
+            )
+            .returning(Position.id)
+        )
+        update_result = await self._db.execute(update_stmt)
+        updated_row = update_result.fetchone()
+        if updated_row is None:
+            logger.warning(
+                "initiate_exit: 状態変更競合（既に CLOSING/CLOSED）pos=%s — スキップ",
+                position.id[:8],
+            )
+            return None
+
+        # Python オブジェクトを DB の状態に同期（stale 回避）
         prev_status = position.status
         position.status = PositionStatus.CLOSING.value
         position.exit_reason = exit_reason.value

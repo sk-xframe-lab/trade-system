@@ -328,6 +328,11 @@ async def manual_close_position(
             broker=broker,
             triggered_by="manual_api",
         )
+        if exit_order is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="ポジションは既にクローズ処理中です（並行リクエスト競合）",
+            )
         logger.info(
             "管理API: ポジション手動クローズ開始（exit注文）pos=%s order=%s",
             position_id[:8], exit_order.id[:8],
