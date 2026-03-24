@@ -138,6 +138,30 @@ def extract_notification_candidates(
     return candidates
 
 
+# ─── Phase S: execution guard hints ──────────────────────────────────────────
+
+_GUARD_BLOCKING_STATES: frozenset[str] = frozenset({"price_stale", "stale_bid_ask", "quote_only"})
+_GUARD_WARNING_STATES: frozenset[str] = frozenset({"wide_spread"})
+
+
+def _build_execution_guard_hints(active_state_codes: list[str]) -> dict:
+    """
+    active state 集合から execution_guard_hints を生成する。
+
+    blocking_reasons: active state のうち _GUARD_BLOCKING_STATES に含まれるもの（ソート済み）
+    warning_reasons:  active state のうち _GUARD_WARNING_STATES  に含まれるもの（ソート済み）
+    has_quote_risk:   blocking または warning が1件でもあれば True
+    """
+    active = set(active_state_codes)
+    blocking = sorted(active & _GUARD_BLOCKING_STATES)
+    warning  = sorted(active & _GUARD_WARNING_STATES)
+    return {
+        "has_quote_risk":   bool(blocking or warning),
+        "blocking_reasons": blocking,
+        "warning_reasons":  warning,
+    }
+
+
 def dispatch_notifications(candidates: list[dict]) -> None:
     """
     通知候補を各通知先に送る。
@@ -325,6 +349,8 @@ class MarketStateEngine:
             active_states = [r.state_code for r in group]
             rule_diag = ctx.rule_diagnostics_by_ticker.get(ticker, {})
 
+            guard_hints = _build_execution_guard_hints(active_states)
+
             if group:
                 primary = group[0]
                 summary = {
@@ -334,6 +360,7 @@ class MarketStateEngine:
                     "evaluated_at": evaluation_time.isoformat(),
                     "state_count": len(group),
                     "rule_diagnostics": rule_diag,
+                    "execution_guard_hints": guard_hints,
                 }
             else:
                 summary = {
@@ -341,6 +368,7 @@ class MarketStateEngine:
                     "evaluated_at": evaluation_time.isoformat(),
                     "state_count": 0,
                     "rule_diagnostics": rule_diag,
+                    "execution_guard_hints": guard_hints,
                 }
 
             await self._repo.upsert_snapshot(
