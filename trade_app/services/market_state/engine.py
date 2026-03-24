@@ -25,6 +25,79 @@ from trade_app.services.market_state.time_window_evaluator import TimeWindowStat
 
 logger = logging.getLogger(__name__)
 
+# ─── Phase O: 通知対象 state whitelist ────────────────────────────────────────
+
+NOTIFIABLE_STATE_CODES: frozenset[str] = frozenset({
+    "wide_spread",
+    "price_stale",
+    "breakout_candidate",
+})
+
+
+def extract_notification_candidates(
+    symbol_results: list[StateEvaluationResult],
+    evaluation_time: datetime,
+) -> list[dict]:
+    """
+    activated かつ NOTIFIABLE_STATE_CODES に含まれる結果を通知 payload のリストとして返す。
+
+    抽出条件:
+      1. is_new_activation == True
+      2. state_code ∈ NOTIFIABLE_STATE_CODES
+
+    それ以外（continued / deactivated / whitelist 外）は無視する。
+    """
+    candidates = []
+    for r in symbol_results:
+        if not r.is_new_activation:
+            continue
+        if r.state_code not in NOTIFIABLE_STATE_CODES:
+            continue
+
+        ev = r.evidence
+        payload: dict = {
+            "ticker": r.target_code,
+            "state_code": r.state_code,
+            "evaluation_time": evaluation_time,
+            "reason": ev.get("reason"),
+            "score": r.score,
+        }
+
+        if r.state_code == "wide_spread":
+            payload.update({
+                "spread": ev.get("spread"),
+                "spread_rate": ev.get("spread_rate"),
+                "current_price": ev.get("current_price"),
+            })
+
+        elif r.state_code == "price_stale":
+            payload.update({
+                "last_updated": ev.get("last_updated"),
+                "age_sec": ev.get("age_sec"),
+                "threshold_sec": ev.get("threshold_sec"),
+            })
+
+        elif r.state_code == "breakout_candidate":
+            payload["score"] = r.score  # 既に含まれているが明示
+
+        candidates.append(payload)
+
+    return candidates
+
+
+def dispatch_notifications(candidates: list[dict]) -> None:
+    """
+    通知候補を各通知先に送る。
+
+    既存通知経路がある場合はそこに流す。
+    失敗は必ず握りつぶす（run 全体を失敗させない）。
+    """
+    for c in candidates:
+        try:
+            logger.info("[NOTIFY] %s", c)
+        except Exception:
+            pass
+
 
 class MarketStateEngine:
     """
@@ -55,15 +128,21 @@ class MarketStateEngine:
         """
         全 Evaluator を実行し、結果を DB に保存する。
 
+        Phase C+1: symbol 状態は遷移ベース保存（activated のみ INSERT / deactivated のみ soft-expire）。
+        non-symbol 状態は従来通り全件 soft-expire + INSERT。
+
         Args:
             ctx: 評価コンテキスト（evaluation_time と任意の market_data を含む）
 
         Returns:
-            保存した StateEvaluationResult のリスト
+            全 Evaluator が返した StateEvaluationResult のリスト
         """
         evaluation_time = ctx.evaluation_time
         if evaluation_time.tzinfo is None:
             evaluation_time = evaluation_time.replace(tzinfo=timezone.utc)
+
+        # Phase C+1: symbol の前サイクル active 状態を ctx に注入（evaluator が使用）
+        await self._load_prev_active_states(ctx)
 
         all_results: list[StateEvaluationResult] = []
 
@@ -82,25 +161,144 @@ class MarketStateEngine:
                     evaluator.name, exc, exc_info=True,
                 )
 
-        if not all_results:
+        # symbol / non-symbol に分割
+        non_symbol = [r for r in all_results if r.layer != "symbol"]
+        symbol_results = [r for r in all_results if r.layer == "symbol"]
+
+        if not non_symbol and not symbol_results and not ctx.symbol_data:
             logger.warning("MarketStateEngine: no evaluation results produced")
             return []
 
-        # ─── 評価結果を DB に保存 ──────────────────────────────────────────
-        await self._repo.save_evaluations(all_results, evaluation_time)
+        # ─── non-symbol: 従来通り全件 soft-expire + INSERT ─────────────────
+        if non_symbol:
+            await self._repo.save_evaluations(non_symbol, evaluation_time)
+
+        # ─── Phase O: activated state の通知 ─────────────────────────────────
+        try:
+            candidates = extract_notification_candidates(symbol_results, evaluation_time)
+            dispatch_notifications(candidates)
+        except Exception as exc:
+            logger.error(
+                "MarketStateEngine: 通知処理エラー: %s — 無視して継続",
+                exc, exc_info=True,
+            )
+
+        # ─── symbol: 遷移ベース保存（activated INSERT / deactivated soft-expire）
+        await self._save_symbol_transitions(symbol_results, ctx, evaluation_time)
 
         # ─── スナップショットを更新 ────────────────────────────────────────
-        await self._update_snapshots(all_results, evaluation_time)
+        if non_symbol:
+            await self._update_snapshots(non_symbol, evaluation_time)
+        await self._update_symbol_snapshots(symbol_results, ctx, evaluation_time)
 
         await self._db.commit()
 
         logger.info(
-            "MarketStateEngine: run complete — %d result(s) saved at %s",
+            "MarketStateEngine: run complete — %d result(s) at %s",
             len(all_results), evaluation_time.isoformat(),
         )
         return all_results
 
-    # ─── スナップショット更新 ──────────────────────────────────────────────────
+    # ─── Phase C+1: 前サイクル状態ロード ──────────────────────────────────────
+
+    async def _load_prev_active_states(self, ctx: EvaluationContext) -> None:
+        """
+        ctx.symbol_data の全 ticker について snapshot から前サイクルの active 状態を取得し、
+        ctx.prev_active_states_by_ticker に設定する。
+
+        snapshot が存在しない ticker は空 set（= 初回扱い、全状態が新規活性化）。
+        """
+        for ticker in ctx.symbol_data:
+            snapshot = await self._repo.get_symbol_snapshot(ticker)
+            if snapshot is not None and snapshot.active_states_json:
+                ctx.prev_active_states_by_ticker[ticker] = set(snapshot.active_states_json)
+            else:
+                ctx.prev_active_states_by_ticker[ticker] = set()
+
+    # ─── Phase C+1: symbol 遷移保存 ───────────────────────────────────────────
+
+    async def _save_symbol_transitions(
+        self,
+        symbol_results: list[StateEvaluationResult],
+        ctx: EvaluationContext,
+        evaluation_time: datetime,
+    ) -> None:
+        """
+        symbol 状態の遷移ベース保存。
+
+        - inactive→active (activated): INSERT
+        - active→active (continuation): 何もしない
+        - active→inactive (deactivated): soft-expire のみ
+        - inactive→inactive: 何もしない
+        """
+        activated = [r for r in symbol_results if r.is_new_activation]
+
+        # ticker ごとに deactivated state_code を収集
+        deactivated_by_target: dict[tuple[str, str, str | None], set[str]] = {}
+        for ticker in ctx.symbol_data:
+            prev_active = ctx.prev_active_states_by_ticker.get(ticker, set())
+            if not prev_active:
+                continue
+            current_codes = {r.state_code for r in symbol_results if r.target_code == ticker}
+            deactivated = prev_active - current_codes
+            if deactivated:
+                deactivated_by_target[("symbol", "symbol", ticker)] = deactivated
+
+        await self._repo.save_evaluations_transitioned(
+            activated, deactivated_by_target, evaluation_time
+        )
+
+    # ─── Phase C+1: symbol スナップショット更新 ───────────────────────────────
+
+    async def _update_symbol_snapshots(
+        self,
+        symbol_results: list[StateEvaluationResult],
+        ctx: EvaluationContext,
+        evaluation_time: datetime,
+    ) -> None:
+        """
+        ctx.symbol_data の全 ticker のスナップショットを UPSERT する。
+
+        active 状態がない ticker も updated_at を更新する（stale 検出のため）。
+        """
+        # ticker → active state_codes マップを構築
+        states_by_ticker: dict[str, list[StateEvaluationResult]] = {}
+        for r in symbol_results:
+            if r.target_code is not None:
+                states_by_ticker.setdefault(r.target_code, []).append(r)
+
+        for ticker in ctx.symbol_data:
+            group = states_by_ticker.get(ticker, [])
+            active_states = [r.state_code for r in group]
+            rule_diag = ctx.rule_diagnostics_by_ticker.get(ticker, {})
+
+            if group:
+                primary = group[0]
+                summary = {
+                    "primary_state": primary.state_code,
+                    "score": primary.score,
+                    "confidence": primary.confidence,
+                    "evaluated_at": evaluation_time.isoformat(),
+                    "state_count": len(group),
+                    "rule_diagnostics": rule_diag,
+                }
+            else:
+                summary = {
+                    "primary_state": None,
+                    "evaluated_at": evaluation_time.isoformat(),
+                    "state_count": 0,
+                    "rule_diagnostics": rule_diag,
+                }
+
+            await self._repo.upsert_snapshot(
+                layer="symbol",
+                target_type="symbol",
+                target_code=ticker,
+                active_state_codes=active_states,
+                summary=summary,
+            )
+
+    # ─── スナップショット更新（non-symbol 用） ─────────────────────────────────
 
     async def _update_snapshots(
         self,
