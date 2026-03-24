@@ -25,13 +25,42 @@ from trade_app.services.market_state.time_window_evaluator import TimeWindowStat
 
 logger = logging.getLogger(__name__)
 
-# ─── Phase O: 通知対象 state whitelist ────────────────────────────────────────
-
+# ─── Phase R: priority ベース通知定義 ─────────────────────────────────────────
+#
+# Priority 1: 新規 activated で無条件通知
+# Priority 2: 新規 activated かつ state 別条件を満たした場合のみ通知
+# 未定義: 通知しない
+#
+# Phase O で追加した NOTIFIABLE_STATE_CODES は Phase R で非使用化。
+# 後方互換のため定数は残すが、extract_notification_candidates() は参照しない。
 NOTIFIABLE_STATE_CODES: frozenset[str] = frozenset({
     "wide_spread",
     "price_stale",
     "breakout_candidate",
 })
+
+STATE_NOTIFICATION_PRIORITY: dict[str, int] = {
+    "wide_spread":          1,
+    "price_stale":          1,
+    "stale_bid_ask":        1,
+    "breakout_candidate":   2,
+    "quote_only":           2,
+}
+
+
+def _check_priority2_condition(r: StateEvaluationResult) -> bool:
+    """
+    Priority 2 state の通知条件を評価する。
+
+    breakout_candidate: score >= 0.8
+    quote_only:         best_bid is not None AND best_ask is not None
+    """
+    ev = r.evidence
+    if r.state_code == "breakout_candidate":
+        return r.score >= 0.8
+    if r.state_code == "quote_only":
+        return ev.get("best_bid") is not None and ev.get("best_ask") is not None
+    return False
 
 
 def extract_notification_candidates(
@@ -39,46 +68,70 @@ def extract_notification_candidates(
     evaluation_time: datetime,
 ) -> list[dict]:
     """
-    activated かつ NOTIFIABLE_STATE_CODES に含まれる結果を通知 payload のリストとして返す。
+    activated かつ STATE_NOTIFICATION_PRIORITY に定義された state を通知 payload のリストとして返す。
 
     抽出条件:
       1. is_new_activation == True
-      2. state_code ∈ NOTIFIABLE_STATE_CODES
+      2. STATE_NOTIFICATION_PRIORITY に state_code が存在する
+      3. priority 1 → 無条件採用
+         priority 2 → state 別条件を満たした場合のみ採用
 
-    それ以外（continued / deactivated / whitelist 外）は無視する。
+    それ以外（continued / deactivated / 未定義 / 条件不一致）は無視する。
     """
     candidates = []
     for r in symbol_results:
         if not r.is_new_activation:
             continue
-        if r.state_code not in NOTIFIABLE_STATE_CODES:
+
+        priority = STATE_NOTIFICATION_PRIORITY.get(r.state_code)
+        if priority is None:
+            continue
+
+        if priority == 2 and not _check_priority2_condition(r):
             continue
 
         ev = r.evidence
         payload: dict = {
-            "ticker": r.target_code,
-            "state_code": r.state_code,
-            "evaluation_time": evaluation_time,
-            "reason": ev.get("reason"),
-            "score": r.score,
+            "ticker":           r.target_code,
+            "state_code":       r.state_code,
+            "evaluation_time":  evaluation_time,
+            "priority":         priority,
+            "reason":           ev.get("reason"),
+            "score":            r.score,
         }
 
         if r.state_code == "wide_spread":
             payload.update({
-                "spread": ev.get("spread"),
-                "spread_rate": ev.get("spread_rate"),
-                "current_price": ev.get("current_price"),
+                "spread":           ev.get("spread"),
+                "spread_rate":      ev.get("spread_rate"),
+                "current_price":    ev.get("current_price"),
             })
 
         elif r.state_code == "price_stale":
             payload.update({
-                "last_updated": ev.get("last_updated"),
-                "age_sec": ev.get("age_sec"),
-                "threshold_sec": ev.get("threshold_sec"),
+                "last_updated":     ev.get("last_updated"),
+                "age_sec":          ev.get("age_sec"),
+                "threshold_sec":    ev.get("threshold_sec"),
+            })
+
+        elif r.state_code == "stale_bid_ask":
+            payload.update({
+                "bid_ask_updated":  ev.get("bid_ask_updated"),
+                "age_sec":          ev.get("age_sec"),
+                "threshold_sec":    ev.get("threshold_sec"),
+                "best_bid":         ev.get("best_bid"),
+                "best_ask":         ev.get("best_ask"),
             })
 
         elif r.state_code == "breakout_candidate":
-            payload["score"] = r.score  # 既に含まれているが明示
+            pass  # score / reason は共通フィールドで提供済み
+
+        elif r.state_code == "quote_only":
+            payload.update({
+                "best_bid":         ev.get("best_bid"),
+                "best_ask":         ev.get("best_ask"),
+                "current_price":    ev.get("current_price"),
+            })
 
         candidates.append(payload)
 

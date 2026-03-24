@@ -82,11 +82,12 @@ class TestExtractionFilter:
         assert candidates == []
 
     def test_all_three_notifiable_states_are_included(self):
-        """全 3 whitelist state が activated → 3件抽出"""
+        """全 3 whitelist state が activated → 3件抽出
+        Phase R: breakout_candidate は score >= 0.8 が必要"""
         results = [
             _result("wide_spread"),
             _result("price_stale"),
-            _result("breakout_candidate"),
+            _result("breakout_candidate", score=0.9),  # Phase R: score >= 0.8 必要
         ]
         candidates = extract_notification_candidates(results, _NOW)
         codes = {c["state_code"] for c in candidates}
