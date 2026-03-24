@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from trade_app.models.current_state_snapshot import CurrentStateSnapshot
 from trade_app.models.signal import TradeSignal
 from trade_app.models.signal_strategy_decision import SignalStrategyDecision
 
@@ -59,6 +60,12 @@ class PlannerContext:
     volume_ratio: float = 1.0                  # 相対出来高（1.0 = 平常、< 1 = 低流動性）
     atr: float | None = None                   # ATR（Average True Range）
     volatility: float | None = None            # ヒストリカル・ボラティリティ（日次）
+
+    # ─── Phase T: execution guard hints ──────────────────────────────────
+    # CurrentStateSnapshot.state_summary_json["execution_guard_hints"] から取得。
+    # execution 側に運ぶだけ（Phase T では未使用）。
+    # スナップショット未取得・未設定の場合は空 dict。
+    execution_guard_hints: dict = field(default_factory=dict)
 
     @property
     def effective_market_price(self) -> float | None:
@@ -153,6 +160,28 @@ class PlannerContextBuilder:
                 signal.id,
             )
 
+        # ─── Phase T: symbol snapshot から execution_guard_hints を取得 ──
+        guard_hints: dict = {}
+        try:
+            snap_result = await self._db.execute(
+                select(CurrentStateSnapshot)
+                .where(
+                    CurrentStateSnapshot.layer == "symbol",
+                    CurrentStateSnapshot.target_code == signal.ticker,
+                )
+                .limit(1)
+            )
+            snap = snap_result.scalar_one_or_none()
+            if snap is not None:
+                guard_hints = (snap.state_summary_json or {}).get(
+                    "execution_guard_hints", {}
+                )
+        except Exception as exc:
+            logger.warning(
+                "PlannerContextBuilder: execution_guard_hints 取得失敗 (ticker=%s): %s",
+                signal.ticker, exc,
+            )
+
         return PlannerContext(
             signal=signal,
             size_ratio=size_ratio,
@@ -166,4 +195,5 @@ class PlannerContextBuilder:
             volume_ratio=volume_ratio,
             atr=atr,
             volatility=volatility,
+            execution_guard_hints=guard_hints,
         )

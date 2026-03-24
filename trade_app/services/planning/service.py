@@ -411,6 +411,12 @@ class SignalPlanningService:
         price = exec_params.limit_price if exec_params else signal.limit_price
         planned_notional = (price * planned_qty) if (price and planned_qty > 0) else None
 
+        # Phase T: execution_guard_hints を trace に追記して execution 側に運ぶ
+        full_trace: list[dict[str, Any]] = list(trace) + [{
+            "stage": "execution_guard_hints",
+            "hints": ctx.execution_guard_hints,
+        }]
+
         plan = SignalPlan(
             id=str(uuid.uuid4()),
             signal_id=signal.id,
@@ -426,7 +432,7 @@ class SignalPlanningService:
             entry_timeout_seconds=exec_params.entry_timeout_seconds if exec_params else None,
             applied_size_ratio=ctx.size_ratio,
             rejection_reason_code=rejection_reason_code.value if rejection_reason_code else None,
-            planning_trace_json=trace,
+            planning_trace_json=full_trace,
             created_at=now,
         )
         self._db.add(plan)
