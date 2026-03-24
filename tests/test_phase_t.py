@@ -253,7 +253,7 @@ class TestPlanningTraceGuardHints:
 
     @pytest.mark.asyncio
     async def test_trace_has_guard_hints_stage(self):
-        hints = {"has_quote_risk": True, "blocking_reasons": ["price_stale"], "warning_reasons": []}
+        hints = {"has_quote_risk": True, "blocking_reasons": ["stale_bid_ask"], "warning_reasons": []}
         ctx = self._make_full_context(hints)
         plan = await self._run_planning(ctx)
 

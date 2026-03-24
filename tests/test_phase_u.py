@@ -278,7 +278,7 @@ class TestNoTradingImpact:
     async def test_planned_qty_unchanged_blocking(self):
         ctx = _make_context({
             "has_quote_risk": True,
-            "blocking_reasons": ["price_stale", "stale_bid_ask", "quote_only"],
+            "blocking_reasons": ["stale_bid_ask", "quote_only"],
             "warning_reasons": ["wide_spread"],
         })
         plan = await _run_full_plan(ctx)
@@ -287,7 +287,7 @@ class TestNoTradingImpact:
     @pytest.mark.asyncio
     async def test_planning_status_unchanged_blocking(self):
         ctx = _make_context({
-            "blocking_reasons": ["price_stale"],
+            "blocking_reasons": ["stale_bid_ask"],
             "warning_reasons": [],
         })
         plan = await _run_full_plan(ctx)
@@ -295,9 +295,9 @@ class TestNoTradingImpact:
 
     @pytest.mark.asyncio
     async def test_no_rejected_error_for_blocking(self):
-        """guard_level=blocking でも SignalPlanRejectedError は送出されない"""
+        """price_stale 以外の guard_level=blocking では SignalPlanRejectedError は送出されない"""
         from trade_app.services.planning.service import SignalPlanRejectedError
-        ctx = _make_context({"blocking_reasons": ["price_stale"], "warning_reasons": []})
+        ctx = _make_context({"blocking_reasons": ["stale_bid_ask"], "warning_reasons": []})
         # 例外が出なければ OK
         plan = await _run_full_plan(ctx)
         assert plan is not None
