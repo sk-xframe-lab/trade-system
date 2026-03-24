@@ -58,6 +58,40 @@ def _get_max_decision_age_sec() -> int:
     return get_settings().SIGNAL_MAX_DECISION_AGE_SEC
 
 
+# ─── Phase U: advisory guard assessment ──────────────────────────────────────
+
+def _build_advisory_guard_assessment(hints: dict) -> dict:
+    """
+    execution_guard_hints から advisory guard assessment を導出する。
+
+    判定ルール:
+      - blocking_reasons が1件以上 → guard_level="blocking" / guard_reasons=blocking + warning
+      - blocking_reasons が空で warning_reasons が1件以上 → guard_level="warning" / guard_reasons=warning
+      - 両方空 → guard_level="none" / guard_reasons=[]
+
+    売買判断は変更しない（advisory-only）。
+    """
+    blocking: list[str] = list(hints.get("blocking_reasons") or [])
+    warning:  list[str] = list(hints.get("warning_reasons")  or [])
+
+    if blocking:
+        guard_level   = "blocking"
+        # blocking → warning の順で重複なく列挙
+        guard_reasons = blocking + [r for r in warning if r not in blocking]
+    elif warning:
+        guard_level   = "warning"
+        guard_reasons = warning
+    else:
+        guard_level   = "none"
+        guard_reasons = []
+
+    return {
+        "stage":        "advisory_guard_assessment",
+        "guard_level":  guard_level,
+        "guard_reasons": guard_reasons,
+    }
+
+
 class SignalPlanRejectedError(Exception):
     """Planning Layer がシグナルを拒否した場合に送出"""
 
@@ -416,6 +450,22 @@ class SignalPlanningService:
             "stage": "execution_guard_hints",
             "hints": ctx.execution_guard_hints,
         }]
+
+        # Phase U: advisory guard assessment（売買判断は不変・advisory-only）
+        try:
+            advisory = _build_advisory_guard_assessment(ctx.execution_guard_hints)
+            full_trace = full_trace + [advisory]
+            if advisory["guard_level"] != "none":
+                logger.warning(
+                    "advisory_guard_assessment: signal_id=%s ticker=%s level=%s reasons=%s",
+                    signal.id, signal.ticker,
+                    advisory["guard_level"], advisory["guard_reasons"],
+                )
+        except Exception as exc:
+            logger.warning(
+                "advisory_guard_assessment 生成失敗 (signal_id=%s): %s — 無視して継続",
+                signal.id, exc,
+            )
 
         plan = SignalPlan(
             id=str(uuid.uuid4()),
