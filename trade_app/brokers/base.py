@@ -70,6 +70,20 @@ class CancelResult:
 
 
 @dataclass
+class MarketData:
+    """
+    銘柄の市場データ（現在値・気配値）。
+
+    SymbolDataFetcher が SymbolStateEvaluator に渡すデータ。
+    取得できないフィールドは None を返す（市場閉場・データなし等の正常系）。
+    """
+    current_price: Optional[float]   # 現在値（pDPP）。取引時間外は None
+    best_bid: Optional[float]        # 最良買気配値（pQBP）。取引時間外は None
+    best_ask: Optional[float]        # 最良売気配値（pQAP）。取引時間外は None
+    vwap: Optional[float] = None     # 当日 VWAP（pVWAP / key=213）。取得不可の場合は None
+
+
+@dataclass
 class BalanceInfo:
     """口座残高情報"""
     cash_balance: float        # 現金残高（円）
@@ -171,6 +185,22 @@ class BrokerAdapter(ABC):
 
         Returns:
             現在価格（円）、取得不可の場合は None
+        """
+        ...
+
+    @abstractmethod
+    async def get_market_data(self, ticker: str) -> "MarketData":
+        """
+        銘柄の市場データ（現在値・最良買気配・最良売気配）を取得する。
+
+        SymbolDataFetcher が SymbolStateEvaluator のデータ供給に使用する。
+        各フィールドが取得できない場合（市場閉場中・データなし等）は None を返す。
+
+        Args:
+            ticker: 銘柄コード
+
+        Returns:
+            MarketData: current_price / best_bid / best_ask（取得不可の場合は None）
         """
         ...
 

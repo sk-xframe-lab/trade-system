@@ -19,6 +19,7 @@ import logging
 from datetime import datetime, timezone
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from trade_app.models.enums import (
@@ -233,7 +234,23 @@ class PositionManager:
             details={"exit_order_pending": True},
         )
 
-        await self._db.flush()  # exit_order.id を確定
+        try:
+            await self._db.flush()  # exit_order.id を確定 + unique index チェック
+        except IntegrityError:
+            await self._db.rollback()
+            await self._db.refresh(position)
+            logger.warning(
+                "initiate_exit: duplicate exit prevented by DB constraint pos=%s",
+                position.id[:8],
+            )
+            await self._audit.log(
+                event_type=AuditEventType.DUPLICATE_EXIT_ATTEMPT,
+                entity_type="position",
+                entity_id=position.id,
+                details={"position_id": position.id, "ticker": position.ticker},
+                message=f"DB制約による二重exit検出: {position.ticker} pos={position.id[:8]}",
+            )
+            return None
 
         # ─── ブローカーへ exit 注文を送信 ──────────────────────────────────
         broker_logger = BrokerCallLogger(self._db)

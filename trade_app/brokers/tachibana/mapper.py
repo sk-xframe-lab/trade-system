@@ -609,24 +609,25 @@ def map_positions(raw: List[dict[str, Any]]) -> List[BrokerPosition]:
     return map_margin_positions(raw)
 
 
-# ─── 現在価格変換 ─────────────────────────────────────────────────────────────
+# ─── 現在価格・気配値変換 ──────────────────────────────────────────────────────
 #
 # 価格照会 API: CLMMfdsGetMarketPrice (sUrlPrice)
 # リクエスト:
 #   sTargetIssueCode: 銘柄コード
-#   sTargetColumn:    取得フィールド指定 (暫定: "pDPP" = 現在値)
-#                     TODO: 仕様書で sTargetColumn の選択肢を確認すること。
+#   sTargetColumn:    取得フィールド指定（カンマ区切りで複数指定可）
+#     pDPP     → 現在値（実測確認済み: 数値キー "115"）
+#     pQBP     → 最良買気配値 / best bid（実測確認済み: 数値キー "184"）
+#     pQAP     → 最良売気配値 / best ask（実測確認済み: 数値キー "182"）
+#     複数指定: "pDPP,pQBP,pQAP" → 3フィールドが1レスポンスに返る（実測確認済み）
 # レスポンス:
-#   aCLMMfdsMarketPrice: 価格データ配列（1要素目を使用）
-#   各要素の価格フィールド: pDPP（現在値 暫定）
+#   aCLMMfdsMarketPrice: 価格データ配列（先頭要素を使用）
+#   各要素: {"sTargetIssueCode": "7203", "pDPP": "3287", "pQBP": "3286", "pQAP": "3287"}
+#           ※ _normalize_keys により数値キー → 文字列キーに変換済み
 #
 # フォールバック:
-#   pDPP が 0 / 空文字 / 欠損 → None（価格取得不能な正常系）
-#   ExitWatcher は None を受け取ると TP/SL をスキップ（TimeStop のみ発火）
-#
-# 暫定項目:
-#   sTargetColumn = "pDPP" は推定値。仕様書で正式フィールド名を確認すること。
-#   aCLMMfdsMarketPrice の構造（配列か / 1要素か）は仕様書で確認すること。
+#   各フィールドが 0 / 空文字 / 欠損 → None（価格取得不能な正常系）
+#   ExitWatcher は current_price=None で TP/SL をスキップ（TimeStop のみ発火）
+#   SymbolStateEvaluator は best_bid=None / best_ask=None で wide_spread をスキップ
 
 
 def map_market_price_from_entry(entry: dict[str, Any]) -> Optional[float]:
@@ -634,9 +635,7 @@ def map_market_price_from_entry(entry: dict[str, Any]) -> Optional[float]:
     aCLMMfdsMarketPrice の1要素 → 現在価格 (Optional[float])。
 
     pDPP が正の値なら float で返す。0 以下・空・欠損なら None を返す。
-
-    暫定: フィールド名 "pDPP" は仕様書未確認。
-    TODO: 仕様書の CLMMfdsGetMarketPrice レスポンス定義を確認すること。
+    ExitWatcher が TP/SL 判定に使用する（後方互換維持）。
     """
     price = _to_float(entry.get("pDPP", ""))
     if price > 0.0:
@@ -653,9 +652,6 @@ def map_market_price(raw: dict[str, Any]) -> Optional[float]:
 
     aCLMMfdsMarketPrice 配列の先頭要素の pDPP を使用する。
     配列が空 / 欠損 / pDPP が 0 以下の場合は None を返す。
-
-    暫定: aCLMMfdsMarketPrice の構造・pDPP フィールド名は仕様書未確認。
-    TODO: 仕様書の CLMMfdsGetMarketPrice レスポンス定義を確認すること。
     """
     entries = raw.get("aCLMMfdsMarketPrice", [])
     if not isinstance(entries, list) or not entries:
@@ -664,6 +660,48 @@ def map_market_price(raw: dict[str, Any]) -> Optional[float]:
     if not isinstance(first, dict):
         return None
     return map_market_price_from_entry(first)
+
+
+def map_symbol_market_data_from_entry(entry: dict[str, Any]) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    aCLMMfdsMarketPrice の1要素 → (current_price, best_bid, best_ask, vwap)。
+
+    各フィールドが正の値なら float で返す。0 以下・空・欠損なら None を返す。
+    SymbolDataFetcher が SymbolStateEvaluator にデータを渡すために使用する。
+
+    フィールド対応（実測確認済み）:
+      pDPP  → current_price（現在値）
+      pQBP  → best_bid（最良買気配値）
+      pQAP  → best_ask（最良売気配値）
+      pVWAP → vwap（当日 VWAP / key=213 / Phase AP 実測確認済み）
+    """
+    def _pos_float(val: str) -> Optional[float]:
+        f = _to_float(val)
+        return f if f > 0.0 else None
+
+    current_price = _pos_float(entry.get("pDPP", ""))
+    best_bid      = _pos_float(entry.get("pQBP", ""))
+    best_ask      = _pos_float(entry.get("pQAP", ""))
+    vwap          = _pos_float(entry.get("pVWAP", ""))
+    return current_price, best_bid, best_ask, vwap
+
+
+def map_symbol_market_data(raw: dict[str, Any]) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    CLMMfdsGetMarketPrice レスポンス（sTargetColumn=pDPP,pQBP,pQAP,pVWAP）
+    → (current_price, best_bid, best_ask, vwap)。
+
+    各フィールドが取得できない正常系（取引時間外・データなし等）は None を返す。
+    aCLMMfdsMarketPrice 配列の先頭要素を使用する。
+    配列が空 / 欠損の場合は (None, None, None, None) を返す。
+    """
+    entries = raw.get("aCLMMfdsMarketPrice", [])
+    if not isinstance(entries, list) or not entries:
+        return None, None, None, None
+    first = entries[0]
+    if not isinstance(first, dict):
+        return None, None, None, None
+    return map_symbol_market_data_from_entry(first)
 
 
 # ─── 数値変換ユーティリティ ────────────────────────────────────────────────────

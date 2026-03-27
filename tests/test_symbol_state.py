@@ -154,24 +154,26 @@ class TestRelativeVolume:
 # ─── 4. スプレッド ────────────────────────────────────────────────────────────
 
 class TestSpread:
-    """wide_spread: (ask - bid) / mid >= 0.3%"""
+    """wide_spread: (ask - bid) / current_price >= 0.3%"""
 
     def test_wide_spread(self):
-        # bid=2997, ask=3015, mid=3006, spread=18, ratio=18/3006=0.599% → wide_spread
-        ctx = _ctx(best_bid=2997.0, best_ask=3015.0)
+        # bid=2997, ask=3015, current_price=3006, spread=18, rate=18/3006≈0.599% → wide_spread
+        ctx = _ctx(current_price=3006.0, best_bid=2997.0, best_ask=3015.0)
         assert "wide_spread" in _states(ctx)
 
     def test_normal_spread(self):
-        # bid=2999, ask=3001, mid=3000, spread=2, ratio=2/3000=0.067% → なし
-        ctx = _ctx(best_bid=2999.0, best_ask=3001.0)
+        # bid=2999, ask=3001, current_price=3000, spread=2, rate=2/3000≈0.067% → なし
+        ctx = _ctx(current_price=3000.0, best_bid=2999.0, best_ask=3001.0)
         assert "wide_spread" not in _states(ctx)
 
     def test_spread_evidence(self):
-        ctx = _ctx(best_bid=2997.0, best_ask=3015.0)
+        ctx = _ctx(current_price=3006.0, best_bid=2997.0, best_ask=3015.0)
         results = _results(ctx)
         r = next(r for r in results if r.state_code == "wide_spread")
         assert r.evidence["best_bid"] == 2997.0
         assert r.evidence["best_ask"] == 3015.0
+        assert r.evidence["current_price"] == 3006.0
+        assert r.evidence["reason"] == "wide_spread"
         assert r.evidence["threshold"] == 0.003
 
 
@@ -476,8 +478,9 @@ class TestSymbolStateEngineDB:
             symbol_data={
                 "7203": {
                     "rsi": 50.0,                   # overextended なし
+                    "current_price": 3000.0,        # wide_spread 分母
                     "best_bid": 2994.0,             # wide_spread 生成
-                    "best_ask": 3006.0,             # spread_ratio = 12/3000 = 0.4%
+                    "best_ask": 3006.0,             # spread_rate = 12/3000 = 0.4%
                 }
             },
         )

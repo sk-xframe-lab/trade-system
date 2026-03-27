@@ -77,17 +77,19 @@ class SymbolDataFetcher:
                     "current_price":  data.current_price,
                     "best_bid":       data.best_bid,
                     "best_ask":       data.best_ask,
+                    "vwap":           data.vwap,
                     "last_updated":   now,
                     # Phase Q: bid/ask 気配の観測時刻。
                     # market の公式 quote timestamp が取れない場合はシステム観測時刻を使う。
                     "bid_ask_updated": now,
                 }
                 logger.debug(
-                    "SymbolDataFetcher: ticker=%s current_price=%s best_bid=%s best_ask=%s",
+                    "SymbolDataFetcher: ticker=%s current_price=%s best_bid=%s best_ask=%s vwap=%s",
                     ticker,
                     data.current_price,
                     data.best_bid,
                     data.best_ask,
+                    data.vwap,
                 )
             except Exception as exc:
                 logger.warning(

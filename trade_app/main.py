@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from trade_app.config import get_settings
 from trade_app.services.exit_watcher import ExitWatcher
 from trade_app.services.market_state.runner import MarketStateRunner
+from trade_app.services.market_state.symbol_data_fetcher import SymbolDataFetcher
 from trade_app.services.order_poller import OrderPoller
 from trade_app.services.recovery_manager import RecoveryManager
 from trade_app.services.strategy.runner import StrategyRunner
@@ -90,8 +91,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     _exit_watcher = ExitWatcher()
     _exit_watcher.start()
 
+    # ブローカーアダプターを生成（SymbolDataFetcher / ExitWatcher で共用するため1インスタンス）
+    if settings.BROKER_TYPE == "tachibana":
+        from trade_app.brokers.tachibana.adapter import TachibanaBrokerAdapter
+        _broker = TachibanaBrokerAdapter()
+    else:
+        from trade_app.brokers.mock_broker import MockBrokerAdapter
+        _broker = MockBrokerAdapter()
+    logger.info("ブローカーアダプター生成: %s", _broker.name)
+
     # MarketStateRunner をバックグラウンドタスクとして起動（60秒周期）
-    _market_state_runner = MarketStateRunner()
+    _symbol_fetcher = SymbolDataFetcher(_broker)
+    _market_state_runner = MarketStateRunner(symbol_fetcher=_symbol_fetcher)
     _market_state_runner.start()
 
     # StrategyRunner をバックグラウンドタスクとして起動（60秒周期）

@@ -80,6 +80,7 @@ services:
       COOKIE_SECURE: ${COOKIE_SECURE:-true}
       TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY:-}
       TOTP_ISSUER: ${TOTP_ISSUER:-TradeSystem Admin}
+      WATCHED_SYMBOLS: ${WATCHED_SYMBOLS:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -88,6 +89,7 @@ services:
     volumes:
       - ./trade_app:/app/trade_app:ro   # コード変更を即時反映（開発時）
       - ./tests:/app/tests:ro           # テストコードも即時反映
+      - ./alembic:/app/alembic:ro       # migration ファイルを即時反映
       - trade_logs:/app/logs
 
 volumes:

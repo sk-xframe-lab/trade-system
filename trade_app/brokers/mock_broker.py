@@ -15,6 +15,7 @@ from trade_app.brokers.base import (
     BrokerAdapter,
     BrokerPosition,
     CancelResult,
+    MarketData,
     OrderRequest,
     OrderResponse,
     OrderStatusResponse,
@@ -72,6 +73,9 @@ class MockBrokerAdapter(BrokerAdapter):
         # 銘柄ごとのモック価格（ticker → price）
         # set_price() で上書き可能。未設定の場合は None を返す
         self._price_overrides: dict[str, float] = {}
+        # 銘柄ごとのモック bid/ask（ticker → (bid, ask)）
+        # set_bid_ask() で上書き可能。未設定の場合は None を返す
+        self._bid_ask_overrides: dict[str, tuple[float, float]] = {}
 
     def queue_behavior(self, behavior: FillBehavior) -> None:
         """
@@ -209,14 +213,36 @@ class MockBrokerAdapter(BrokerAdapter):
         """
         return self._price_overrides.get(ticker)
 
+    async def get_market_data(self, ticker: str) -> MarketData:
+        """
+        銘柄のモック市場データを返す。
+        set_price() / set_bid_ask() で設定した値を返す。未設定の場合は None。
+
+        テスト・開発時に SymbolStateEvaluator への入力を制御するために使用する。
+        例:
+            broker.set_price("7203", 3000.0)
+            broker.set_bid_ask("7203", bid=2990.0, ask=3010.0)
+        """
+        price = self._price_overrides.get(ticker)
+        bid_ask = self._bid_ask_overrides.get(ticker)
+        best_bid = bid_ask[0] if bid_ask else None
+        best_ask = bid_ask[1] if bid_ask else None
+        return MarketData(current_price=price, best_bid=best_bid, best_ask=best_ask)
+
     def set_price(self, ticker: str, price: float) -> None:
         """銘柄のモック価格を設定する（ExitWatcher テスト用）"""
         self._price_overrides[ticker] = price
         logger.debug("[MockBroker] 価格設定: %s = %.0f円", ticker, price)
 
+    def set_bid_ask(self, ticker: str, bid: float, ask: float) -> None:
+        """銘柄のモック bid/ask を設定する（SymbolStateEvaluator テスト用）"""
+        self._bid_ask_overrides[ticker] = (bid, ask)
+        logger.debug("[MockBroker] bid/ask 設定: %s bid=%.0f ask=%.0f", ticker, bid, ask)
+
     def clear_price(self, ticker: str) -> None:
         """銘柄のモック価格設定をクリアする"""
         self._price_overrides.pop(ticker, None)
+        self._bid_ask_overrides.pop(ticker, None)
 
     async def get_balance(self) -> BalanceInfo:
         """口座残高を返す（Mock固定値）"""

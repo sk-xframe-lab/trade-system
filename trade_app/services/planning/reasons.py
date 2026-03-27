@@ -37,6 +37,9 @@ class PlanningReasonCode(str, enum.Enum):
     # ─── 資金 ─────────────────────────────────────────────────────────────
     BUYING_POWER_UNAVAILABLE = "buying_power_unavailable"  # 買付余力が不足
 
+    # ─── Phase V: execution hard guard ────────────────────────────────────────
+    EXECUTION_GUARD_PRICE_STALE = "execution_guard_price_stale"  # price_stale hard guard
+
     # ─── サイズ調整（縮小理由） ───────────────────────────────────────────
     SIZE_RATIO_APPLIED = "size_ratio_applied"       # strategy size_ratio による縮小
     LIQUIDITY_REDUCTION = "liquidity_reduction"     # 流動性による縮小
@@ -53,3 +56,9 @@ class PlanningStatus(str, enum.Enum):
     ACCEPTED = "accepted"   # 変更なし、または許容範囲内の縮小で受け入れ
     REDUCED = "reduced"     # 縮小あり、ただし最小サイズ以上で発注可
     REJECTED = "rejected"   # 発注不可（サイズ不足・tradable でない等）
+
+
+# ─── Phase W: shadow hard guard trace 用定数 ─────────────────────────────────
+# これは reject reason 用ではなく shadow trace 用として使う。
+# PlanningReasonCode enum に含めない（signal_plan_reasons には記録されない）。
+EXECUTION_GUARD_STALE_BID_ASK_SHADOW = "execution_guard_stale_bid_ask_shadow"

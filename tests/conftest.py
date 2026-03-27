@@ -44,6 +44,8 @@ import trade_app.models.signal_strategy_decision  # noqa: F401
 # Phase 9 Signal Planning Layer モデル
 import trade_app.models.signal_plan  # noqa: F401
 import trade_app.models.signal_plan_reason  # noqa: F401
+# Phase AT Daily Metrics モデル
+import trade_app.models.daily_price_history  # noqa: F401
 # Admin UI モデル（管理画面専用テーブル）
 import trade_app.admin.models.ui_user  # noqa: F401
 import trade_app.admin.models.ui_session  # noqa: F401

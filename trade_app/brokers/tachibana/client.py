@@ -69,8 +69,13 @@ _NUMERIC_KEY_MAP: dict[str, str] = {
     # 注意: sUrlPrice レスポンスは sResultCode ("688") を含まない。
     #       p_errno ("287") = "0" のみで正常を判定する。
     # 配列キー "71" の各要素もネストした数値キーを持つ → _normalize_keys で再帰変換する。
-    "71":  "aCLMMfdsMarketPrice",     # 価格データ配列（要素内の "115" も再帰変換される）
-    "115": "pDPP",                    # 現在値（円）。取引時間外は空文字列
+    # sTargetColumn の複数指定はカンマ区切り（実測確認済み: "pDPP,pQBP,pQAP"）
+    "71":  "aCLMMfdsMarketPrice",     # 価格データ配列（要素内の数値キーも再帰変換される）
+    "473": "sTargetIssueCode",        # 銘柄コード（実測確認済み: "7203" 等）
+    "115": "pDPP",                    # 現在値（円）。取引時間外は空文字列（実測確認済み）
+    "184": "pQBP",                    # 最良買気配値（best bid, 円）。取引時間外は空（実測確認済み）
+    "182": "pQAP",                    # 最良売気配値（best ask, 円）。取引時間外は空（実測確認済み）
+    "213": "pVWAP",                   # 当日 VWAP（円）。Phase AP 実測: 返却確認済み（key=213）
     # ─── 現物保有照会 CLMGenbutuKabuList ──────────────────────────────────────
     "88":  "aGenbutuKabuList",        # 現物保有一覧配列（実測確認済み）
     "859": "sUriOrderIssueCode",      # 銘柄コード（実測: "6501", "6502", "9984"）
@@ -92,9 +97,10 @@ _NUMERIC_KEY_MAP: dict[str, str] = {
 
 _P_ERRNO_OK = 0
 
-# 暫定: p_errno 認証エラーコード（セッション切れ・未ログイン）
-# TODO: 仕様書で p_errno コード体系を確認すること。
+# p_errno 認証エラーコード（セッション切れ・未ログイン）
+# これらのコードは BrokerAuthError を送出し、adapter が invalidate() → 次回 ensure_session() で再ログインする。
 _P_ERRNO_AUTH_CODES: frozenset[int] = frozenset({
+    2,       # セッション切断（実測: p_err_msg="セッションが切断しました。"）→ 再ログイン必要
     10001,   # 暫定: セッション認証エラー（再ログイン必要）
 })
 
@@ -271,8 +277,8 @@ class TachibanaClient:
         p_errno が存在しないか 0 の場合は何もしない。
         認証エラー p_errno は BrokerAuthError、それ以外は BrokerAPIError。
 
-        暫定: p_errno コード体系は仕様書未確認の部分あり。
-        TODO: 仕様書の p_errno 定義を確認して _P_ERRNO_AUTH_CODES を更新すること。
+        p_errno=2 はセッション切断（実測確認済み）。_P_ERRNO_AUTH_CODES に含まれる。
+        仕様書で他の認証系コードが判明した場合は _P_ERRNO_AUTH_CODES を更新すること。
         """
         raw = data.get("p_errno")
         if raw is None:

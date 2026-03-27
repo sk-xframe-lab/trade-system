@@ -26,6 +26,7 @@ from trade_app.brokers.base import (
     BrokerAuthError,
     BrokerPosition,
     CancelResult,
+    MarketData,
     OrderRequest,
     OrderResponse,
     OrderStatusResponse,
@@ -481,11 +482,12 @@ class TachibanaBrokerAdapter(BrokerAdapter):
             )
 
         # ── 3. リクエスト payload 構築 ────────────────────────────────────────
-        # sTargetColumn = "pDPP" は暫定値。仕様書確認後に更新すること。
+        # sTargetColumn = "pDPP" は現在値のみ取得（後方互換維持）
+        # 実測確認済み: pDPP=現在値(key=115)
         payload = {
-            "sCLMID":          "CLMMfdsGetMarketPrice",  # 仕様書確認済み
-            "sTargetIssueCode": ticker,                   # 仕様書確認済み
-            "sTargetColumn":   "pDPP",                   # 暫定: TODO 仕様書確認
+            "sCLMID":           "CLMMfdsGetMarketPrice",  # 仕様書確認済み
+            "sTargetIssueCode": ticker,                    # 仕様書確認済み
+            "sTargetColumn":    "pDPP",                    # 実測確認済み
         }
 
         logger.info("get_market_price: 価格照会 ticker=%s url=%s", ticker, price_url)
@@ -506,3 +508,83 @@ class TachibanaBrokerAdapter(BrokerAdapter):
             price,
         )
         return price
+
+    # ─── get_market_data ──────────────────────────────────────────────────────
+
+    async def get_market_data(self, ticker: str) -> MarketData:
+        """
+        銘柄の市場データ（現在値・最良買気配・最良売気配）を照会して返す。
+
+        SymbolDataFetcher が SymbolStateEvaluator のデータ供給に使用する。
+        各フィールドが取得できない場合（取引時間外・データなし等）は None を返す。
+
+        仕様確認済み（実測）:
+          sTargetColumn = "pDPP,pQBP,pQAP,pVWAP" でカンマ区切り複数指定が可能。
+          pDPP  → 現在値（数値キー "115"）
+          pQBP  → 最良買気配値 best bid（数値キー "184"）
+          pQAP  → 最良売気配値 best ask（数値キー "182"）
+          pVWAP → 当日 VWAP（数値キー "213" / Phase AP 実測確認済み）
+
+        Args:
+            ticker: 銘柄コード（例: "7203"）
+
+        Returns:
+            MarketData: current_price / best_bid / best_ask / vwap（取得不可の場合は None）
+
+        Raises:
+            BrokerTemporaryError:   タイムアウト・ネットワークエラー
+            BrokerAuthError:        認証失敗（セッション無効化済み）
+            BrokerMaintenanceError: メンテナンス中
+            BrokerAPIError:         その他 API エラー
+        """
+        # ── 1. セッション確保 + 取引可否チェック ─────────────────────────────
+        try:
+            await self._session.ensure_session()
+        except BrokerAuthError:
+            logger.error("get_market_data: ログイン失敗 ticker=%s", ticker)
+            raise
+
+        if not self._session.is_usable:
+            raise BrokerAPIError(
+                "立花証券セッションが取引不可状態です "
+                "(sKinsyouhouMidokuFlg=1: 禁止事項の未読通知あり)。"
+                "立花証券 Web サイトにログインして通知を確認してください。"
+            )
+
+        # ── 2. 価格照会専用 URL (sUrlPrice) を取得 ────────────────────────────
+        price_url = self._session.url_price
+        if not price_url:
+            raise BrokerAPIError(
+                "仮想 URL が空です。セッションが正常に確立されていない可能性があります。"
+            )
+
+        # ── 3. リクエスト payload 構築 ────────────────────────────────────────
+        # sTargetColumn カンマ区切りで現在値・最良買気配・最良売気配・VWAP を同時取得（実測確認済み）
+        payload = {
+            "sCLMID":           "CLMMfdsGetMarketPrice",  # 仕様書確認済み
+            "sTargetIssueCode": ticker,                    # 仕様書確認済み
+            "sTargetColumn":    "pDPP,pQBP,pQAP,pVWAP",  # 実測確認済み（pVWAP=key 213 追加）
+        }
+
+        logger.info("get_market_data: 価格照会 ticker=%s url=%s", ticker, price_url)
+
+        # ── 4. 送信 ───────────────────────────────────────────────────────────
+        try:
+            raw = await self._client.request(price_url, payload)
+        except BrokerAuthError:
+            self._handle_auth_error("get_market_data", f"ticker={ticker}")
+            raise
+
+        # ── 5. レスポンス変換 ─────────────────────────────────────────────────
+        current_price, best_bid, best_ask, vwap = mapper.map_symbol_market_data(raw)
+
+        logger.info(
+            "get_market_data: 照会完了 ticker=%s current_price=%s best_bid=%s best_ask=%s vwap=%s",
+            ticker, current_price, best_bid, best_ask, vwap,
+        )
+        return MarketData(
+            current_price=current_price,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            vwap=vwap,
+        )

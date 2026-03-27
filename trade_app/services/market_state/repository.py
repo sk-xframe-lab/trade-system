@@ -92,6 +92,72 @@ class MarketStateRepository:
         logger.debug("MarketStateRepository: saved %d evaluation(s)", len(saved))
         return saved
 
+    # ─── 遷移ベース評価結果保存（Phase C+1） ─────────────────────────────────────
+
+    async def save_evaluations_transitioned(
+        self,
+        activated: list[StateEvaluationResult],
+        deactivated_by_target: dict[tuple[str, str, str | None], set[str]],
+        evaluation_time: datetime,
+    ) -> list[StateEvaluation]:
+        """
+        遷移ベースの評価結果保存。
+
+        - activated（is_new_activation=True）のみ INSERT する。
+        - deactivated_by_target に含まれる state_code のみ soft-expire する。
+        - 継続中（is_new_activation=False）は INSERT も soft-expire も行わない。
+
+        Args:
+            activated: 新規活性化した StateEvaluationResult のリスト
+            deactivated_by_target: {(layer, target_type, target_code): {deactivated state_codes}}
+            evaluation_time: 評価時刻
+        Returns:
+            INSERT した StateEvaluation のリスト
+        """
+        # 1. deactivated の state_code のみ soft-expire
+        for (layer, target_type, target_code), state_codes in deactivated_by_target.items():
+            if target_code is None:
+                target_cond = StateEvaluation.target_code.is_(None)
+            else:
+                target_cond = StateEvaluation.target_code == target_code
+            await self._db.execute(
+                update(StateEvaluation)
+                .where(
+                    StateEvaluation.layer == layer,
+                    StateEvaluation.target_type == target_type,
+                    target_cond,
+                    StateEvaluation.state_code.in_(state_codes),
+                    StateEvaluation.is_active.is_(True),
+                )
+                .values(is_active=False)
+            )
+
+        # 2. activated のみ INSERT
+        saved: list[StateEvaluation] = []
+        for result in activated:
+            row = StateEvaluation(
+                layer=result.layer,
+                target_type=result.target_type,
+                target_code=result.target_code,
+                evaluation_time=evaluation_time,
+                state_code=result.state_code,
+                score=result.score,
+                confidence=result.confidence,
+                is_active=True,
+                evidence_json=result.evidence,
+                expires_at=result.expires_at,
+            )
+            self._db.add(row)
+            saved.append(row)
+
+        if saved:
+            await self._db.flush()
+        logger.debug(
+            "MarketStateRepository: transitioned %d activated, %d group(s) deactivated",
+            len(saved), len(deactivated_by_target),
+        )
+        return saved
+
     # ─── スナップショット UPSERT ───────────────────────────────────────────────
 
     async def upsert_snapshot(

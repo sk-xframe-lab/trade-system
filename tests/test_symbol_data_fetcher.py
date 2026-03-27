@@ -193,12 +193,12 @@ class TestFetchCallOrder:
 
     @pytest.mark.asyncio
     async def test_result_contains_expected_fields(self):
-        """fetch 結果は current_price / best_bid / best_ask / last_updated / bid_ask_updated の5フィールドを含む"""
+        """fetch 結果は current_price / best_bid / best_ask / vwap / last_updated / bid_ask_updated の6フィールドを含む"""
         broker = _make_broker({"7203": _md(3400.0, bid=3390.0, ask=3410.0)})
         fetcher = SymbolDataFetcher(broker)
         result = await fetcher.fetch(["7203"])
         assert set(result["7203"].keys()) == {
-            "current_price", "best_bid", "best_ask", "last_updated", "bid_ask_updated"
+            "current_price", "best_bid", "best_ask", "vwap", "last_updated", "bid_ask_updated"
         }
 
 

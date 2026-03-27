@@ -91,7 +91,8 @@ class TestSaveEvaluationsGroupingRegression:
         engine = MarketStateEngine(db_session)
 
         ctx1 = _ctx(1, current_open=3060.0, prev_close=3000.0)  # gap_up_open
-        ctx2 = _ctx(2, best_bid=2994.0, best_ask=3006.0)         # wide_spread (0.4%)
+        # wide_spread: current_price は分母として必須。spread_rate=12/3000=0.4% → 発火
+        ctx2 = _ctx(2, current_price=3000.0, best_bid=2994.0, best_ask=3006.0)
 
         await engine.run(ctx1)
         await engine.run(ctx2)

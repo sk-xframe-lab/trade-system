@@ -47,7 +47,20 @@ from trade_app.services.planning.adjusters import (
 )
 from trade_app.services.planning.context import PlannerContext
 from trade_app.services.planning.execution_params import ExecutionParamsBuilder
-from trade_app.services.planning.reasons import PlanningReasonCode, PlanningStatus
+from trade_app.services.planning.reasons import (
+    EXECUTION_GUARD_STALE_BID_ASK_SHADOW,
+    PlanningReasonCode,
+    PlanningStatus,
+)
+from trade_app.services.planning.trace_helpers import (
+    extract_shadow_hard_guard_aggregate_review_key,
+    extract_shadow_hard_guard_aggregate_review_verdict,
+    extract_shadow_hard_guard_assessment,
+    extract_shadow_hard_guard_promotion_decision,
+    extract_shadow_hard_guard_promotion_metrics,
+    extract_shadow_hard_guard_review_summary,
+    upsert_trace_stage,
+)
 from trade_app.services.planning.sizer import BaseSizer
 
 logger = logging.getLogger(__name__)
@@ -174,6 +187,49 @@ class SignalPlanningService:
                 now=now,
             )
             raise SignalPlanRejectedError(plan.id, rejection[0], rejection[1])
+
+        # ─── Step 1b: hard guard check（price_stale のみ）────────────────
+        _hints = ctx.execution_guard_hints
+        if (
+            _hints.get("blocking_reasons")
+            and "price_stale" in _hints["blocking_reasons"]
+        ):
+            plan = await self._save_plan(
+                signal=signal,
+                ctx=ctx,
+                status=PlanningStatus.REJECTED,
+                planned_qty=0,
+                exec_params=None,
+                rejection_reason_code=PlanningReasonCode.EXECUTION_GUARD_PRICE_STALE,
+                trace=[{
+                    "stage":    "hard_guard_decision",
+                    "decision": "reject",
+                    "reason":   PlanningReasonCode.EXECUTION_GUARD_PRICE_STALE.value,
+                }],
+                reasons=[(
+                    PlanningReasonCode.EXECUTION_GUARD_PRICE_STALE,
+                    "price_stale hard guard: 価格データが古いため発注を拒否",
+                    {"execution_guard_hints": _hints},
+                    None,
+                    None,
+                )],
+                now=now,
+            )
+            raise SignalPlanRejectedError(
+                plan.id,
+                PlanningReasonCode.EXECUTION_GUARD_PRICE_STALE,
+                "price_stale hard guard: 価格データが古いため発注を拒否",
+            )
+
+        # ─── Step 1c: shadow hard guard（stale_bid_ask）────────────────
+        _blocking = _hints.get("blocking_reasons") or []
+        if "stale_bid_ask" in _blocking:
+            trace.append({
+                "stage":     "shadow_hard_guard_decision",
+                "candidate": "stale_bid_ask",
+                "decision":  "would_reject",
+                "reason":    EXECUTION_GUARD_STALE_BID_ASK_SHADOW,
+            })
 
         # ─── Step 2: ベースサイズ + strategy size_ratio 適用 ────────────
         size_result = self._sizer.calculate(ctx.base_quantity, ctx.size_ratio)
@@ -454,7 +510,7 @@ class SignalPlanningService:
         # Phase U: advisory guard assessment（売買判断は不変・advisory-only）
         try:
             advisory = _build_advisory_guard_assessment(ctx.execution_guard_hints)
-            full_trace = full_trace + [advisory]
+            full_trace = upsert_trace_stage(full_trace, advisory)
             if advisory["guard_level"] != "none":
                 logger.warning(
                     "advisory_guard_assessment: signal_id=%s ticker=%s level=%s reasons=%s",
@@ -464,6 +520,87 @@ class SignalPlanningService:
         except Exception as exc:
             logger.warning(
                 "advisory_guard_assessment 生成失敗 (signal_id=%s): %s — 無視して継続",
+                signal.id, exc,
+            )
+
+        # Phase X: shadow hard guard assessment（観測用派生データ・売買判断不変）
+        try:
+            shadow_assessment = extract_shadow_hard_guard_assessment(full_trace)
+            full_trace = upsert_trace_stage(full_trace, {
+                "stage": "shadow_hard_guard_assessment",
+                **shadow_assessment,
+            })
+        except Exception as exc:
+            logger.warning(
+                "shadow_hard_guard_assessment 生成失敗 (signal_id=%s): %s — 無視して継続",
+                signal.id, exc,
+            )
+
+        # Phase Y: shadow hard guard review summary（昇格判断補助の派生データ）
+        try:
+            review_summary = extract_shadow_hard_guard_review_summary(
+                full_trace, candidate="stale_bid_ask"
+            )
+            full_trace = upsert_trace_stage(full_trace, review_summary)
+        except Exception as exc:
+            logger.warning(
+                "shadow_hard_guard_review_summary 生成失敗 (signal_id=%s): %s — 無視して継続",
+                signal.id, exc,
+            )
+
+        # Phase AA: shadow hard guard promotion metrics（昇格レビュー指標の派生データ）
+        try:
+            promo_metrics = extract_shadow_hard_guard_promotion_metrics(
+                full_trace,
+                execution_guard_hints=ctx.execution_guard_hints,
+                candidate="stale_bid_ask",
+            )
+            full_trace = upsert_trace_stage(full_trace, promo_metrics)
+        except Exception as exc:
+            logger.warning(
+                "shadow_hard_guard_promotion_metrics 生成失敗 (signal_id=%s): %s — 無視して継続",
+                signal.id, exc,
+            )
+
+        # Phase AB: provisional promotion decision（昇格判定基準の固定・観測用）
+        try:
+            promo_decision = extract_shadow_hard_guard_promotion_decision(
+                full_trace,
+                execution_guard_hints=ctx.execution_guard_hints,
+                candidate="stale_bid_ask",
+            )
+            full_trace = upsert_trace_stage(full_trace, promo_decision)
+        except Exception as exc:
+            logger.warning(
+                "shadow_hard_guard_promotion_decision 生成失敗 (signal_id=%s): %s — 無視して継続",
+                signal.id, exc,
+            )
+
+        # Phase AC: aggregate review key（集計用正規化キー）
+        try:
+            agg_key = extract_shadow_hard_guard_aggregate_review_key(
+                full_trace,
+                execution_guard_hints=ctx.execution_guard_hints,
+                candidate="stale_bid_ask",
+            )
+            full_trace = upsert_trace_stage(full_trace, agg_key)
+        except Exception as exc:
+            logger.warning(
+                "shadow_hard_guard_aggregate_review_key 生成失敗 (signal_id=%s): %s — 無視して継続",
+                signal.id, exc,
+            )
+
+        # Phase AD: aggregate review verdict（集計結果読み方固定ラベル）
+        try:
+            agg_verdict = extract_shadow_hard_guard_aggregate_review_verdict(
+                full_trace,
+                execution_guard_hints=ctx.execution_guard_hints,
+                candidate="stale_bid_ask",
+            )
+            full_trace = upsert_trace_stage(full_trace, agg_verdict)
+        except Exception as exc:
+            logger.warning(
+                "shadow_hard_guard_aggregate_review_verdict 生成失敗 (signal_id=%s): %s — 無視して継続",
                 signal.id, exc,
             )
 

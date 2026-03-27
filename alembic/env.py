@@ -26,6 +26,8 @@ from trade_app.models import (  # noqa: F401, E402
 from trade_app.models import trading_halt, position_exit_transition  # noqa: F401, E402
 # Phase 4 Market State Engine モデル
 from trade_app.models import state_definition, state_evaluation, current_state_snapshot  # noqa: F401, E402
+# Phase AT Daily Metrics モデル
+from trade_app.models import daily_price_history  # noqa: F401, E402
 
 config = context.config
 

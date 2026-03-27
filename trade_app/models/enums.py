@@ -141,3 +141,4 @@ class AuditEventType(str, enum.Enum):
     HALT_ACTIVATED = "halt_activated"           # 取引停止発動
     HALT_DEACTIVATED = "halt_deactivated"       # 取引停止解除
     SYSTEM_ERROR = "system_error"               # システムエラー
+    DUPLICATE_EXIT_ATTEMPT = "duplicate_exit_attempt"  # DB制約による二重exit検出

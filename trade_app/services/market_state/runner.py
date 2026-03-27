@@ -11,8 +11,8 @@ MarketStateRunner — MarketStateEngine 定期実行ジョブ
 
 銘柄データ:
   WATCHED_SYMBOLS（カンマ区切り）に登録された銘柄を評価対象とする。
-  Phase 1 では symbol_data を空にして実行（時間帯・市場状態のみ評価）。
-  Phase 2 以降でブローカー API から価格データを取得して symbol_data を充実させる。
+  Phase 2 以降は SymbolDataFetcher 経由でブローカー API から価格データを取得する。
+  symbol_fetcher=None の場合は Phase 1 動作（symbol_data 空）にフォールバックする。
 
 失敗分離方針:
   - 1 evaluator の失敗は engine 層で握りつぶしループ継続（MarketStateEngine 設計）
@@ -25,11 +25,18 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
+from typing import Optional
+
+import zoneinfo
 
 from trade_app.config import get_settings
 from trade_app.models.database import AsyncSessionLocal
+from trade_app.services.market_state.daily_metrics import DailyMetricsComputer, DailyMetricsRepository
 from trade_app.services.market_state.engine import MarketStateEngine
 from trade_app.services.market_state.schemas import EvaluationContext
+from trade_app.services.market_state.symbol_data_fetcher import SymbolDataFetcher
+
+_JST = zoneinfo.ZoneInfo("Asia/Tokyo")
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +56,11 @@ class MarketStateRunner:
       - エラーは error レベル
     """
 
-    def __init__(self) -> None:
+    def __init__(self, symbol_fetcher: Optional[SymbolDataFetcher] = None) -> None:
         self._task: asyncio.Task | None = None
         self._running: bool = False
         self._warned_empty_symbols: bool = False  # 空シンボル警告を1度だけ出すフラグ
+        self._symbol_fetcher = symbol_fetcher
 
     def start(self) -> None:
         """バックグラウンドタスクを起動する。"""
@@ -116,21 +124,45 @@ class MarketStateRunner:
             )
             self._warned_empty_symbols = True
 
-        # Phase 1: symbol_data は空（銘柄価格データの取得は Phase 2 以降）
-        # WATCHED_SYMBOLS が設定されていても Phase 1 ではデータなし → SymbolStateEvaluator は空を返す
+        # Phase 2: SymbolDataFetcher 経由で current_price を取得
+        # symbol_fetcher=None の場合は Phase 1 動作（symbol_data 空）にフォールバック
         symbol_data: dict = {}
         if watched:
-            logger.debug(
-                "MarketStateRunner: watched_symbols=%s (symbol_data は Phase 2 で充実化)",
-                watched,
-            )
+            if self._symbol_fetcher is not None:
+                symbol_data = await self._symbol_fetcher.fetch(watched)
+                logger.debug(
+                    "MarketStateRunner: symbol_data 取得完了 — %d/%d tickers",
+                    len(symbol_data),
+                    len(watched),
+                )
+            else:
+                logger.debug(
+                    "MarketStateRunner: watched_symbols=%s (symbol_fetcher 未設定: Phase 1 動作)",
+                    watched,
+                )
 
-        ctx = EvaluationContext(
-            evaluation_time=now,
-            symbol_data=symbol_data,
-        )
-
+        # Phase AT: 日次メトリクス注入 + エンジン実行（同一 DB セッション）
         async with AsyncSessionLocal() as db:
+            if symbol_data:
+                today_jst = datetime.now(_JST).date()
+                daily_repo = DailyMetricsRepository(db)
+                for ticker in list(symbol_data.keys()):
+                    rows = await daily_repo.get_recent_rows(ticker, n=21)
+                    metrics = DailyMetricsComputer.compute(rows, today_jst)
+                    symbol_data[ticker].update(metrics)
+                    logger.debug(
+                        "MarketStateRunner: daily metrics ticker=%s ma5=%s ma20=%s atr=%s rsi=%s",
+                        ticker,
+                        metrics.get("ma5"),
+                        metrics.get("ma20"),
+                        metrics.get("atr"),
+                        metrics.get("rsi"),
+                    )
+
+            ctx = EvaluationContext(
+                evaluation_time=now,
+                symbol_data=symbol_data,
+            )
             engine = MarketStateEngine(db)
             results = await engine.run(ctx)
 

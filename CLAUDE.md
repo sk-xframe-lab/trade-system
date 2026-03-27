@@ -1728,3 +1728,1637 @@ DB スキーマ変更なし（migration 不要）。コミット: `4feedef`
 | 001〜011 | 既存（orders.cancel_requested_at まで） |
 | 012 | current_strategy_decisions partial unique index |
 | 013 (head) | current_state_snapshots partial unique index |
+
+---
+
+## 今回の作業サマリー (2026-03-24 — Phase E: overextended rule 化)
+
+### 実施内容
+
+#### 依存型ルールの rule 化（第1弾: overextended）
+
+`_evaluate_symbol()` にインラインで書かれていた RSI 過熱判定を `_rule_overextended()` として module レベルに切り出し、独立 rule 構造に統一した。
+
+**変更内容:**
+
+| 項目 | 内容 |
+|---|---|
+| `_rule_overextended()` 追加 | `ticker, data, *, rsi_overbought, rsi_oversold, make` の signature |
+| `_evaluate_symbol()` 修正 | インライン RSI 判定（15行）を削除し、独立 rule リストに1行追加 |
+| `rsi = data.get("rsi")` 削除 | トップのデータ抽出ブロックから RSI 抽出を削除（rule 内で取得） |
+
+**ガード:** `rsi is None` → `None`（key なしも同様）
+
+**発火条件:**
+- `rsi >= RSI_OVERBOUGHT (75.0)` → `direction="overbought"` / `score = max(0.3, min(1.0, (rsi - 75) / 15))`
+- `rsi <= RSI_OVERSOLD (25.0)` → `direction="oversold"` / `score = max(0.3, min(1.0, (25 - rsi) / 15))`
+
+**Why:** `_evaluate_symbol()` に state 固有判定が直書きされると新 state 追加のたびにメソッドが肥大化する。rule 分離により追加コストが「関数1つ + リスト1行」に圧縮された。overextended は RSI のみに依存する完全独立 rule のため今回の対象として最適。
+
+**How to apply:** `overextended` は `wide_spread` / `price_stale` と同様に独立 rule リストから呼ばれる。遷移保存フロー（初回 INSERT / 継続 skip / 解除 soft-expire / 再発火 INSERT）は既存のまま動作。
+
+#### テスト: `tests/test_phase_e.py` 追加（33件）
+
+| クラス | 件数 | 内容 |
+|---|---|---|
+| `TestRuleOverextendedDirect` | 20件 | `_rule_overextended()` 直接呼び出し（ガード・非発火・発火・score・evidence） |
+| `TestOrchestratorOverextended` | 6件 | `evaluate()` 経由の結合確認 |
+| `TestStructureOverextended` | 3件 | module レベル存在確認・インライン判定消去確認 |
+| `TestOverextendedTransitions` | 4件 | `engine.run()` 経由の遷移テスト（初回/継続/解消/再発火） |
+
+**テスト**: 983 件全通過（950 → 983、+33件）
+
+### 変更ファイル一覧
+
+| ファイル | 変更内容 |
+|---|---|
+| `trade_app/services/market_state/symbol_evaluator.py` | `_rule_overextended()` 追加・インライン RSI 判定削除・rule リストに追加 |
+| `tests/test_phase_e.py` | **新規作成** 33件 |
+
+### 現在の独立 rule 一覧
+
+| rule 関数 | state_code | 系統 |
+|---|---|---|
+| `_rule_wide_spread` | `wide_spread` | 価格差系 |
+| `_rule_price_stale` | `price_stale` | 鮮度系 |
+| `_rule_overextended` | `overextended` | RSI 過熱系 |
+
+依存型ルール（`_evaluate_symbol()` インライン）: `gap_up_open`, `gap_down_open`, 出来高系, トレンド系, レンジ, ボラティリティ, `breakout_candidate`
+
+### 次フェーズ候補
+
+1. **observability 強化** — skip 系理由（`invalid_current_price` / `no_bid` 等）を snapshot の `state_summary_json` に記録
+2. **breakout_candidate の rule 化** — `is_high_volume` / `is_gap_up` / `is_gap_down` を引数で受け取る形に整理
+
+---
+
+## 今回の作業サマリー (2026-03-24 — Phase F: symbol_volatility_high rule 化)
+
+### 実施内容
+
+#### 依存型ルールの rule 化（第2弾: symbol_volatility_high）
+
+`_evaluate_symbol()` のインライン ATR 高水準判定を `_rule_symbol_volatility_high()` として module レベルに切り出した。
+
+**変更内容:**
+
+| 項目 | 内容 |
+|---|---|
+| `_rule_symbol_volatility_high()` 追加 | `ticker, data, *, atr_ratio_high, make` の signature |
+| `_evaluate_symbol()` 修正 | インライン ATR 高水準判定（8行）を削除し、独立 rule リストに1行追加 |
+| `current_price` / `atr` のトップ抽出は維持 | `symbol_range`（インライン）が引き続き使用するため |
+
+**ガード:** `current_price is None or <= 0` / `atr is None` → `None`
+
+**発火条件:** `atr / current_price >= atr_ratio_high (0.02)` → `symbol_volatility_high`
+
+**score:** `min(1.0, atr_ratio / 0.05)`（ATR 5% → score 1.0）
+
+**Why:** `symbol_volatility_high` は `current_price` と `atr` のみに依存する完全独立 rule。Phase E（overextended）と同じパターンで切り出しを実施。
+
+**How to apply:** `symbol_range`（ATR < threshold）と条件が排他的ではあるが独立した state code。両者が同時 active になることはないが rule は独立して処理される。
+
+#### テスト: `tests/test_phase_f.py` 追加（30件）
+
+| クラス | 件数 | 内容 |
+|---|---|---|
+| `TestRuleVolatilityHighDirect` | 17件 | 直接呼び出し（ガード・非発火・発火・score・evidence） |
+| `TestOrchestratorVolatilityHigh` | 6件 | `evaluate()` 経由の結合確認 |
+| `TestStructureVolatilityHigh` | 3件 | module レベル存在確認・インライン判定消去確認 |
+| `TestVolatilityHighTransitions` | 4件 | `engine.run()` 経由の遷移テスト（初回/継続/解消/再発火） |
+
+**テスト**: 1013 件全通過（983 → 1013、+30件）
+
+### 変更ファイル一覧
+
+| ファイル | 変更内容 |
+|---|---|
+| `trade_app/services/market_state/symbol_evaluator.py` | `_rule_symbol_volatility_high()` 追加・インライン ATR 高水準判定削除・rule リストに追加 |
+| `tests/test_phase_f.py` | **新規作成** 30件 |
+
+### 現在の独立 rule 一覧
+
+| rule 関数 | state_code | 系統 |
+|---|---|---|
+| `_rule_wide_spread` | `wide_spread` | 価格差系 |
+| `_rule_price_stale` | `price_stale` | 鮮度系 |
+| `_rule_overextended` | `overextended` | RSI 過熱系 |
+| `_rule_symbol_volatility_high` | `symbol_volatility_high` | ATR ボラティリティ系 |
+
+依存型ルール（`_evaluate_symbol()` インライン）: `gap_up_open`, `gap_down_open`, 出来高系, トレンド系, `symbol_range`, `breakout_candidate`
+
+### 次フェーズ候補
+
+1. **breakout_candidate の rule 化** — `is_high_volume` / `is_gap_up` / `is_gap_down` を引数で受け取る形に整理
+
+---
+
+## 今回の作業サマリー (2026-03-24 — Phase G: observability 強化)
+
+### 実施内容
+
+#### 各 rule の診断情報を state_summary_json に記録
+
+4つの独立 rule に `status`（active/inactive/skipped）と主要メトリクスを返す診断サマリを追加した。
+
+**変更内容:**
+
+| 項目 | 内容 |
+|---|---|
+| `_rule_*()` 戻り値変更 | `StateEvaluationResult \| None` → `tuple[StateEvaluationResult \| None, dict[str, Any]]` |
+| `EvaluationContext` 拡張 | `rule_diagnostics_by_ticker: dict[str, dict[str, dict[str, Any]]]` フィールド追加 |
+| `_evaluate_symbol()` 戻り値変更 | `list[...]` → `tuple[list[...], dict[str, dict[str, Any]]]` |
+| `evaluate()` 更新 | `ctx.rule_diagnostics_by_ticker[ticker] = rule_diagnostics` に書き込み |
+| `engine.py` 更新 | `_update_symbol_snapshots()` で `state_summary_json["rule_diagnostics"]` に注入 |
+| 既存テスト修正 | `test_phase_d〜f` の `_call_rule()` ラッパーをアンパック対応に変更 |
+
+**診断 status:**
+- `"active"` — rule が発火した
+- `"inactive"` — rule を評価したが閾値未満だった
+- `"skipped"` — 必要なデータが不足して評価しなかった（gate）
+
+**Why:** rule が active でない理由（データ欠損・閾値未満）を `state_summary_json` で追えるようにすることで、strategy engine の blocked 判定やアラート設計を補完する。スキーマ大改修なし・既存挙動変更なし。
+
+**How to apply:** `CurrentStateSnapshot.state_summary_json["rule_diagnostics"]` に 4 キーが常に存在する。ticker に対する symbol データが存在しない場合は `rule_diagnostics` はスナップショットに含まれない。
+
+#### テスト: `tests/test_phase_g.py` 追加（27件）
+
+| クラス | 件数 | 内容 |
+|---|---|---|
+| `TestWidespreadDiagnostic` | 6件 | active/inactive/skipped(×4) 診断内容 |
+| `TestPriceStaleDiagnostic` | 5件 | active(×3)/inactive/skipped |
+| `TestOverextendedDiagnostic` | 4件 | active overbought/oversold / inactive / skipped |
+| `TestVolatilityHighDiagnostic` | 4件 | active/inactive/skipped(×2) |
+| `TestAllRuleKeysPresent` | 3件 | 4 キーが常に存在 |
+| `TestSnapshotDiagnostics` | 5件 | engine snapshot 統合テスト |
+
+**テスト**: 1040 件全通過（1013 → 1040、+27件）
+
+### 変更ファイル一覧
+
+| ファイル | 変更内容 |
+|---|---|
+| `trade_app/services/market_state/schemas.py` | `rule_diagnostics_by_ticker` フィールド追加 |
+| `trade_app/services/market_state/symbol_evaluator.py` | 4 rule の戻り値を tuple に変更、`_evaluate_symbol()` / `evaluate()` 更新 |
+| `trade_app/services/market_state/engine.py` | `_update_symbol_snapshots()` に `rule_diagnostics` 注入 |
+| `tests/test_phase_d.py` | `_call_rule()` ラッパー追加 + 全呼び出し箇所を修正 |
+| `tests/test_phase_d_plus_1.py` | `_call_rule()` をアンパック対応に変更 |
+| `tests/test_phase_e.py` | `_call_rule()` をアンパック対応に変更 |
+| `tests/test_phase_f.py` | `_call_rule()` をアンパック対応に変更 |
+| `tests/test_phase_g.py` | **新規作成** 27件 |
+
+---
+
+## 今回の作業サマリー (2026-03-24 — Phase H: breakout_candidate rule 化)
+
+### 実施内容
+
+#### 依存型ルールの rule 化（第3弾: breakout_candidate）
+
+`_evaluate_symbol()` のインライン breakout_candidate 判定を `_rule_breakout_candidate()` として module レベルに切り出した。
+依存引数（`is_high_volume` / `is_gap_up` / `is_gap_down`）はキーワード引数として明示的に渡す形を採用し、独立 rule との一貫した構造に統合した。
+
+**変更内容:**
+
+| 項目 | 内容 |
+|---|---|
+| `_rule_breakout_candidate()` 追加 | `ticker, data, *, is_high_volume, is_gap_up, is_gap_down, make` の signature |
+| `_evaluate_symbol()` 修正 | インライン breakout 判定（20行）を削除し、独立 rule ループに1行追加 |
+| `test_phase_g.py` 更新 | `_RULE_KEYS` に `"breakout_candidate"` を追加（equality check のため必須）|
+
+**ガード:** `current_price is None or <= 0` → skipped / `no_current_price` / `ma20 is None or <= 0` → skipped / `no_ma20`
+
+**発火条件:**
+- `current_price > ma20`
+- AND `is_high_volume` (vol_ratio >= 2.0)
+- AND NOT `is_gap_up`, NOT `is_gap_down`
+
+**score:** `max(0.3, min(1.0, pct_above_ma20 / 0.03))`（MA20 比 3% 上 → score 1.0）
+
+**Why:** breakout_candidate はギャップ・出来高判定に依存するが、それらの依存値を引数で受け取ることで rule 関数として独立させられる。これで `_evaluate_symbol()` のインラインロジックをすべて rule ベース構造で扱えることを確認した。
+
+**How to apply:** 依存型 rule でも依存引数をキーワード引数として明示渡しすることで、既存の rule ループに追加するだけで同じ診断サマリ（status/metrics）が state_summary_json["rule_diagnostics"] に記録される。
+
+#### テスト: `tests/test_phase_h.py` 追加（36件）
+
+| クラス | 件数 | 内容 |
+|---|---|---|
+| `TestRuleBreakoutCandidateDirect` | 15件 | 直接呼び出し（ガード・非発火・発火・score・evidence） |
+| `TestOrchestratorBreakout` | 5件 | `evaluate()` 経由の結合確認 |
+| `TestStructureBreakout` | 3件 | module レベル存在確認・インライン判定消去確認 |
+| `TestBreakoutCandidateTransitions` | 4件 | `engine.run()` 経由の遷移テスト（初回/継続/解消/再発火） |
+| `TestBreakoutCandidateDiagnostic` | 9件 | active/inactive/skipped 診断・rule_diagnostics キー存在確認 |
+
+**テスト**: 1076 件全通過（1040 → 1076、+36件）
+
+### 変更ファイル一覧
+
+| ファイル | 変更内容 |
+|---|---|
+| `trade_app/services/market_state/symbol_evaluator.py` | `_rule_breakout_candidate()` 追加・インライン判定削除・rule ループに追加 |
+| `tests/test_phase_g.py` | `_RULE_KEYS` に `"breakout_candidate"` 追加・`test_all_rules_active` データ更新 |
+| `tests/test_phase_h.py` | **新規作成** 36件 |
+
+### 現在の独立 rule 一覧（Phase H 完了時点）
+
+| rule 関数 | state_code | 系統 | 依存引数 |
+|---|---|---|---|
+| `_rule_wide_spread` | `wide_spread` | 価格差系 | なし |
+| `_rule_price_stale` | `price_stale` | 鮮度系 | なし |
+| `_rule_overextended` | `overextended` | RSI 過熱系 | なし |
+| `_rule_symbol_volatility_high` | `symbol_volatility_high` | ATR ボラティリティ系 | なし |
+| `_rule_breakout_candidate` | `breakout_candidate` | ブレイクアウト系 | `is_high_volume`, `is_gap_up`, `is_gap_down` |
+
+依存型ルール（`_evaluate_symbol()` インライン）: `gap_up_open`, `gap_down_open`, 出来高系, トレンド系, `symbol_range`
+
+### 次フェーズ候補
+
+1. **gap / volume / trend / range の rule 化** — 残るインライン判定を順次切り出し
+
+---
+
+## 今回の作業サマリー (2026-03-24 — Phase I: gap_up_open / gap_down_open rule 化)
+
+### 目的
+
+`_evaluate_symbol()` のインライン gap 判定（上下対称）を module レベル rule に切り出し、Phase H で確立した依存引数注入パターンを再利用する。
+
+### 変更内容
+
+#### `_rule_gap_up_open()` / `_rule_gap_down_open()` 追加
+
+```
+signature: (ticker, data, *, gap_threshold: float, make: _MakeFn) -> tuple[StateEvaluationResult | None, dict]
+```
+
+- `current_open`, `prev_close` は関数内で `data.get()` — top extraction から削除
+- guard: `no_current_open` / `no_prev_close` / `zero_prev_close` → `None, {status: "skipped"}`
+- 非発火: `gap_pct < gap_threshold` (up) / `gap_pct > -gap_threshold` (down) → `None, {status: "inactive", gap_pct}`
+- score: `min(1.0, gap_pct / 0.04)` (up) / `min(1.0, abs(gap_pct) / 0.04)` (down)
+
+#### `_evaluate_symbol()` 修正
+
+| 変更 | 内容 |
+|---|---|
+| `rule_diagnostics = {}` の初期化位置 | rule ループ直前 → メソッド冒頭（gap 診断をループより先に記録するため） |
+| インライン gap ブロック（20行）削除 | `_rule_gap_up_open()` / `_rule_gap_down_open()` 呼び出しに置き換え |
+| `current_open`, `prev_close` のトップ抽出 | 削除（rule 内部で `data.get()` する） |
+| `is_gap_up` / `is_gap_down` 算出 | `_gap_up_result is not None` / `_gap_down_result is not None` |
+
+#### `test_phase_g.py` 更新
+
+- `_RULE_KEYS` に `"gap_up_open"`, `"gap_down_open"` を追加（7キー）
+- `test_all_rules_active` を2データセット構成に変更（gap と no-gap は同時発火しないため）
+
+#### テスト: `tests/test_phase_i.py` 追加（45件）
+
+| クラス | 件数 | 内容 |
+|---|---|---|
+| `TestRuleGapUpOpenDirect` | 12 | guard × 3 / 非発火 × 4 / 発火 × 2 / score × 2 / evidence × 1 |
+| `TestRuleGapDownOpenDirect` | 11 | guard × 3 / 非発火 × 3 / 発火 × 2 / score × 2 / evidence × 2 |
+| `TestOrchestratorGap` | 5 | up / down / no-gap / coexist wide_spread / mutual exclusion |
+| `TestStructureGap` | 4 | module level × 2 / calls both rules / no inline current_open |
+| `TestGapUpOpenTransitions` | 4 | initial insert / continuation skip / deactivation / reactivation |
+| `TestGapDiagnostic` | 9 | active × 2 / inactive × 2 / skipped × 2 / both keys × 1 / active via evaluate × 2 |
+
+### テスト結果
+
+1121 passed（全体）/ 45 passed（test_phase_i.py）/ 既存回帰なし
+
+### 変更ファイル
+
+| ファイル | 変更内容 |
+|---|---|
+| `trade_app/services/market_state/symbol_evaluator.py` | `_rule_gap_up_open()` / `_rule_gap_down_open()` 追加・インライン判定削除・`rule_diagnostics` 初期化位置変更 |
+| `tests/test_phase_g.py` | `_RULE_KEYS` に gap 2キー追加・`test_all_rules_active` 2データセット化 |
+| `tests/test_phase_i.py` | **新規作成** 45件 |
+
+### 現在の独立 rule 一覧（Phase I 完了時点）
+
+| rule 関数 | state_code | 系統 | 依存引数 |
+|---|---|---|---|
+| `_rule_wide_spread` | `wide_spread` | 価格差系 | なし |
+| `_rule_price_stale` | `price_stale` | 鮮度系 | なし |
+| `_rule_overextended` | `overextended` | RSI 過熱系 | なし |
+| `_rule_symbol_volatility_high` | `symbol_volatility_high` | ATR ボラティリティ系 | なし |
+| `_rule_gap_up_open` | `gap_up_open` | ギャップ系 | `gap_threshold` |
+| `_rule_gap_down_open` | `gap_down_open` | ギャップ系 | `gap_threshold` |
+| `_rule_breakout_candidate` | `breakout_candidate` | ブレイクアウト系 | `is_high_volume`, `is_gap_up`, `is_gap_down` |
+
+依存型ルール（`_evaluate_symbol()` インライン）: 出来高系, トレンド系, `symbol_range`
+
+### 次フェーズ候補
+
+1. **volume / trend / range の rule 化** — 残るインライン判定を順次切り出し
+
+---
+
+## 今回の作業サマリー (2026-03-24 — Phase J: high_relative_volume / low_liquidity rule 化)
+
+### 目的
+
+`_evaluate_symbol()` のインライン出来高判定を `_rule_high_relative_volume()` / `_rule_low_liquidity()` として module レベルに切り出し、Phase I で確立した依存引数注入パターンを再利用する。
+
+### 変更内容
+
+#### `_rule_high_relative_volume()` / `_rule_low_liquidity()` 追加
+
+```
+signature: (ticker, data, *, volume_ratio_high/low: float, make: _MakeFn) -> tuple[StateEvaluationResult | None, dict]
+```
+
+- `current_volume`, `avg_volume_same_time` は関数内で `data.get()` — top extraction から削除
+- guard: `no_current_volume` / `no_avg_volume` / `zero_avg_volume` → `None, {status: "skipped"}`
+- high_relative_volume 非発火: `vol_ratio < volume_ratio_high` → `None, {status: "inactive", vol_ratio}`
+- low_liquidity 非発火: `vol_ratio >= volume_ratio_low` → `None, {status: "inactive", vol_ratio}`
+- score: `min(1.0, vol_ratio / 4.0)` (high) / `max(0.1, 1.0 - vol_ratio / threshold)` (low)
+- `high_relative_volume` と `low_liquidity` は排他的（vol_ratio が両方の閾値を同時に満たすことはない）
+
+#### `_evaluate_symbol()` 修正
+
+| 変更 | 内容 |
+|---|---|
+| インライン出来高ブロック（22行）削除 | `_rule_high_relative_volume()` / `_rule_low_liquidity()` 呼び出しに置き換え |
+| `current_volume`, `avg_volume_same_time` のトップ抽出 | 削除（rule 内部で `data.get()` する） |
+| `is_high_volume` 算出 | `_high_vol_result is not None` |
+
+#### `test_phase_g.py` 更新
+
+- `_RULE_KEYS` に `"high_relative_volume"`, `"low_liquidity"` を追加（9キー）
+- `test_all_rules_active` に `high_relative_volume` / `low_liquidity` のアサーション追加（low_liquidity は別データセット）
+
+#### テスト: `tests/test_phase_j.py` 追加（43件）
+
+| クラス | 件数 | 内容 |
+|---|---|---|
+| `TestRuleHighRelativeVolumeDirect` | 10 | guard × 3 / 非発火 × 2 / 発火 × 2 / score × 3 / evidence × 1 |
+| `TestRuleLowLiquidityDirect` | 10 | guard × 3 / 非発火 × 3 / 発火 × 1 / score × 2 / evidence × 1 |
+| `TestOrchestratorVolume` | 5 | high / low / no-vol / 排他 / coexist breakout |
+| `TestStructureVolume` | 4 | module level × 2 / calls both rules / no inline vol_ratio |
+| `TestHighRelativeVolumeTransitions` | 4 | initial insert / continuation skip / deactivation / reactivation |
+| `TestVolumeDiagnostic` | 9 | active × 2 / inactive × 2 / skipped × 2 / both keys × 1 / via evaluate × 2 |
+
+### テスト結果
+
+1164 passed（全体）/ 43 passed（test_phase_j.py）/ 既存回帰なし
+
+### 変更ファイル
+
+| ファイル | 変更内容 |
+|---|---|
+| `trade_app/services/market_state/symbol_evaluator.py` | `_rule_high_relative_volume()` / `_rule_low_liquidity()` 追加・インライン判定削除 |
+| `tests/test_phase_g.py` | `_RULE_KEYS` に volume 2キー追加・`test_all_rules_active` アサーション追加 |
+| `tests/test_phase_j.py` | **新規作成** 43件 |
+
+### 現在の独立 rule 一覧（Phase J 完了時点）
+
+| rule 関数 | state_code | 系統 | 依存引数 |
+|---|---|---|---|
+| `_rule_wide_spread` | `wide_spread` | 価格差系 | なし |
+| `_rule_price_stale` | `price_stale` | 鮮度系 | なし |
+| `_rule_overextended` | `overextended` | RSI 過熱系 | なし |
+| `_rule_symbol_volatility_high` | `symbol_volatility_high` | ATR ボラティリティ系 | なし |
+| `_rule_gap_up_open` | `gap_up_open` | ギャップ系 | `gap_threshold` |
+| `_rule_gap_down_open` | `gap_down_open` | ギャップ系 | `gap_threshold` |
+| `_rule_high_relative_volume` | `high_relative_volume` | 出来高系 | `volume_ratio_high` |
+| `_rule_low_liquidity` | `low_liquidity` | 出来高系 | `volume_ratio_low` |
+| `_rule_breakout_candidate` | `breakout_candidate` | ブレイクアウト系 | `is_high_volume`, `is_gap_up`, `is_gap_down` |
+
+依存型ルール（`_evaluate_symbol()` インライン）: トレンド系（`symbol_trend_up`, `symbol_trend_down`）, `symbol_range`
+
+### 次フェーズ候補
+
+1. **trend / range の rule 化** — 残るインライン判定を順次切り出し
+
+---
+
+## 今回の作業サマリー (2026-03-24 — Phase K: symbol_trend_up / symbol_trend_down rule 化)
+
+### 目的
+
+`_evaluate_symbol()` のインライントレンド判定（上下対称）を `_rule_symbol_trend_up()` / `_rule_symbol_trend_down()` として module レベルに切り出し、依存引数注入パターンを再利用する。
+
+### 変更内容
+
+#### `_rule_symbol_trend_up()` / `_rule_symbol_trend_down()` 追加
+
+```
+signature: (ticker, data, *, make: _MakeFn) -> tuple[StateEvaluationResult | None, dict]
+```
+
+- `current_price`, `vwap`, `ma5`, `ma20` は関数内で `data.get()` — top extraction から削除
+- guard: `no_current_price` / `no_vwap` / `no_ma5` / `no_ma20` / `zero_vwap` / `zero_ma20` → skipped
+- trend_up 発火: `price > vwap AND ma5 > ma20`
+- trend_down 発火: `price < vwap AND ma5 < ma20`（等号は両方とも inactive）
+- 混合状態（片方のみ成立）→ どちらも inactive
+- score: `max(0.3, min(1.0, (vwap_diff + ma_diff) * 20))`
+
+#### `_evaluate_symbol()` 修正
+
+| 変更 | 内容 |
+|---|---|
+| インライントレンドブロック（30行）削除 | `_rule_symbol_trend_up()` / `_rule_symbol_trend_down()` 呼び出しに置き換え |
+| `vwap`, `ma5`, `ma20` のトップ抽出 | 削除（rule 内部で `data.get()` する） |
+| `is_trend_up` / `is_trend_down` 算出 | `_trend_up_result is not None` / `_trend_down_result is not None` |
+| `current_price`, `atr` | 引き続きトップ抽出（range rule が使用） |
+
+#### `test_phase_g.py` 更新
+
+- `_RULE_KEYS` に `"symbol_trend_up"`, `"symbol_trend_down"` を追加（11キー）
+- `test_all_rules_active` の "no gap" データに `vwap=900.0, ma5=1050.0` 追加（trend_up 発火）
+- trend_down 用の別データセット追加
+
+#### テスト: `tests/test_phase_k.py` 追加（45件）
+
+| クラス | 件数 | 内容 |
+|---|---|---|
+| `TestRuleSymbolTrendUpDirect` | 14 | guard × 6 / 非発火 × 3 / 発火 × 1 / score × 3 / evidence × 1 |
+| `TestRuleSymbolTrendDownDirect` | 9 | guard × 2 / 非発火 × 4 / 発火 × 1 / score × 2 / evidence × 1 |
+| `TestOrchestratorTrend` | 5 | up / down / mixed / 排他 / coexist high_vol |
+| `TestStructureTrend` | 4 | module level × 2 / calls both rules / no inline vwap |
+| `TestSymbolTrendUpTransitions` | 4 | initial insert / continuation skip / deactivation / reactivation |
+| `TestTrendDiagnostic` | 9 | active × 2 / inactive × 2 / skipped × 2 / both keys × 1 / via evaluate × 2 |
+
+### テスト結果
+
+1210 passed（全体）/ 45 passed（test_phase_k.py）/ 既存回帰なし
+
+### 変更ファイル
+
+| ファイル | 変更内容 |
+|---|---|
+| `trade_app/services/market_state/symbol_evaluator.py` | `_rule_symbol_trend_up()` / `_rule_symbol_trend_down()` 追加・インライン判定削除・`vwap/ma5/ma20` トップ抽出削除 |
+| `tests/test_phase_g.py` | `_RULE_KEYS` に trend 2キー追加・`test_all_rules_active` データ更新 |
+| `tests/test_phase_k.py` | **新規作成** 45件 |
+
+### 現在の独立 rule 一覧（Phase K 完了時点）
+
+| rule 関数 | state_code | 系統 | 依存引数 |
+|---|---|---|---|
+| `_rule_wide_spread` | `wide_spread` | 価格差系 | なし |
+| `_rule_price_stale` | `price_stale` | 鮮度系 | なし |
+| `_rule_overextended` | `overextended` | RSI 過熱系 | なし |
+| `_rule_symbol_volatility_high` | `symbol_volatility_high` | ATR ボラティリティ系 | なし |
+| `_rule_gap_up_open` | `gap_up_open` | ギャップ系 | `gap_threshold` |
+| `_rule_gap_down_open` | `gap_down_open` | ギャップ系 | `gap_threshold` |
+| `_rule_high_relative_volume` | `high_relative_volume` | 出来高系 | `volume_ratio_high` |
+| `_rule_low_liquidity` | `low_liquidity` | 出来高系 | `volume_ratio_low` |
+| `_rule_symbol_trend_up` | `symbol_trend_up` | トレンド系 | なし（data から直接取得）|
+| `_rule_symbol_trend_down` | `symbol_trend_down` | トレンド系 | なし（data から直接取得）|
+| `_rule_breakout_candidate` | `breakout_candidate` | ブレイクアウト系 | `is_high_volume`, `is_gap_up`, `is_gap_down` |
+
+依存型ルール（`_evaluate_symbol()` インライン）: `symbol_range` のみ
+
+### 次フェーズ候補
+
+1. **symbol_range の rule 化** — 最後のインライン判定を切り出し（`is_trend_up`, `is_trend_down` を依存引数で渡す）
+
+---
+
+## 今回の作業サマリー (2026-03-24 — Phase L: symbol_range rule 化・全 state 判定の rule 化完了)
+
+### 目的
+
+`_evaluate_symbol()` の最後のインライン state 判定 `symbol_range` を `_rule_symbol_range()` として module レベルに切り出し、evaluator の全 state 判定を rule ベースに揃える。
+
+### 変更内容
+
+#### `_rule_symbol_range()` 追加
+
+```
+signature: (ticker, data, *, is_trend_up, is_trend_down, atr_ratio_high, make) -> tuple[StateEvaluationResult | None, dict]
+```
+
+- `current_price`, `atr` は関数内で `data.get()` — `_evaluate_symbol()` のトップ抽出を全削除
+- guard: `no_current_price`（None または <= 0）/ `no_atr` → skipped
+- inactive: `is_trend_up or is_trend_down` → `{reason: "trending", is_trend_up, is_trend_down}`
+- inactive: `atr_ratio >= atr_ratio_high` → `{atr_ratio}`
+- score: `max(0.1, 1.0 - atr_ratio / atr_ratio_high)`（ATR が低いほど高スコア）
+
+#### `_evaluate_symbol()` 修正
+
+| 変更 | 内容 |
+|---|---|
+| インライン range ブロック（15行）削除 | `_rule_symbol_range()` を rule ループに追加 |
+| `current_price`, `atr` のトップ抽出削除 | 全 rule 関数が内部で `data.get()` — `_evaluate_symbol()` に `data.get()` ゼロ |
+| コメント修正 | `data.get()` という文字列がコメントに残らないよう変更（構造テストが pass するように）|
+
+#### `test_phase_g.py` 更新
+
+- `_RULE_KEYS` に `"symbol_range"` を追加（12キー）
+- `test_all_rules_active` に `symbol_range` 用データセット追加（トレンドなし・低 ATR）
+
+#### テスト: `tests/test_phase_l.py` 追加（32件）
+
+| クラス | 件数 | 内容 |
+|---|---|---|
+| `TestRuleSymbolRangeDirect` | 11 | guard × 3 / 非発火（依存）× 2 / 非発火（ATR）× 2 / 発火 × 1 / score × 2 / evidence × 1 |
+| `TestOrchestratorRange` | 5 | range / no-range × 3 / coexist wide_spread |
+| `TestStructureRange` | 4 | module level / calls rule / no inline / **no data.get()** |
+| `TestSymbolRangeTransitions` | 4 | initial insert / continuation skip / deactivation / reactivation |
+| `TestRangeDiagnostic` | 8 | active / inactive × 2 / skipped × 2 / key present / via evaluate × 2 |
+
+### マイルストーン
+
+`_evaluate_symbol()` 内の `data.get()` がゼロになった。全 12 state が `_rule_*()` 関数として独立し、`_evaluate_symbol()` は純粋な orchestrator として機能する。
+
+### テスト結果
+
+1242 passed（全体）/ 32 passed（test_phase_l.py）/ 既存回帰なし
+
+### 変更ファイル
+
+| ファイル | 変更内容 |
+|---|---|
+| `trade_app/services/market_state/symbol_evaluator.py` | `_rule_symbol_range()` 追加・インライン判定削除・`current_price/atr` トップ抽出削除・コメント修正 |
+| `tests/test_phase_g.py` | `_RULE_KEYS` に `symbol_range` 追加・`test_all_rules_active` データ追加 |
+| `tests/test_phase_l.py` | **新規作成** 32件 |
+
+### 現在の独立 rule 一覧（Phase L 完了時点 — 全 state rule 化済み）
+
+| rule 関数 | state_code | 系統 | 依存引数 |
+|---|---|---|---|
+| `_rule_wide_spread` | `wide_spread` | 価格差系 | なし |
+| `_rule_price_stale` | `price_stale` | 鮮度系 | なし |
+| `_rule_overextended` | `overextended` | RSI 過熱系 | なし |
+| `_rule_symbol_volatility_high` | `symbol_volatility_high` | ATR ボラティリティ系 | なし |
+| `_rule_gap_up_open` | `gap_up_open` | ギャップ系 | `gap_threshold` |
+| `_rule_gap_down_open` | `gap_down_open` | ギャップ系 | `gap_threshold` |
+| `_rule_high_relative_volume` | `high_relative_volume` | 出来高系 | `volume_ratio_high` |
+| `_rule_low_liquidity` | `low_liquidity` | 出来高系 | `volume_ratio_low` |
+| `_rule_symbol_trend_up` | `symbol_trend_up` | トレンド系 | なし |
+| `_rule_symbol_trend_down` | `symbol_trend_down` | トレンド系 | なし |
+| `_rule_symbol_range` | `symbol_range` | レンジ系 | `is_trend_up`, `is_trend_down`, `atr_ratio_high` |
+| `_rule_breakout_candidate` | `breakout_candidate` | ブレイクアウト系 | `is_high_volume`, `is_gap_up`, `is_gap_down` |
+
+`_evaluate_symbol()` インライン state 判定: **なし**（全 rule 化完了）
+
+### 次フェーズ候補
+
+1. **新規 rule の追加** — 新たな state コードを rule として追加する場合は `_rule_*()` 関数1つ + rule ループ1行で完結
+2. **rule の閾値設定外部化** — YAML/DB 設定で閾値をサイクルごとに変更できる仕組み
+3. **rule 評価の並列化** — 独立 rule を asyncio.gather で並列実行（latency 改善）
+
+---
+
+## 今回の作業サマリー (2026-03-24 — Phase M: rule registry 明文化・single loop 統一)
+
+### 目的
+
+- rule registry の明文化: 全 state code を module レベルで一覧できるようにする
+- `_evaluate_symbol()` を single loop にする: rule 追加手順が「関数追加 + registry 1行 + _rules リスト 1行」で完結
+- diagnostics 統一: `symbol_range` high ATR inactive に `reason: "high_atr"` を追加（trending と区別可能に）
+
+### 変更内容
+
+#### `_RULE_REGISTRY` / `_RULE_DEP_FLAGS` 追加（module レベル定数）
+
+```python
+_RULE_REGISTRY: tuple[str, ...] = (
+    "gap_up_open", "gap_down_open",
+    "high_relative_volume", "low_liquidity",
+    "symbol_trend_up", "symbol_trend_down",
+    "wide_spread", "price_stale", "overextended", "symbol_volatility_high",
+    "symbol_range", "breakout_candidate",
+)
+
+_RULE_DEP_FLAGS: dict[str, str] = {
+    "gap_up_open":          "is_gap_up",
+    "gap_down_open":        "is_gap_down",
+    "high_relative_volume": "is_high_volume",
+    "symbol_trend_up":      "is_trend_up",
+    "symbol_trend_down":    "is_trend_down",
+}
+```
+
+#### `_evaluate_symbol()` を single loop + deps dict に書き換え
+
+- 旧実装: gap/volume/trend の3ブロック（各 rule を個別に呼ぶ）+ for ループ（6 rule）
+- 新実装: `deps: dict[str, bool]` + `_rules = [(state_code, lambda), ...]` + 1つの for ループ
+
+```python
+deps: dict[str, bool] = {}
+_rules = [
+    ("gap_up_open", lambda: _rule_gap_up_open(...)),
+    ...
+    ("symbol_range", lambda: _rule_symbol_range(..., is_trend_up=deps.get("is_trend_up", False), ...)),
+    ("breakout_candidate", lambda: _rule_breakout_candidate(..., is_gap_up=deps.get("is_gap_up", False), ...)),
+]
+for _state_code, _rule_fn in _rules:
+    _result, _diag = _rule_fn()
+    if _result is not None: results.append(_result)
+    rule_diagnostics[_state_code] = _diag
+    if _state_code in _RULE_DEP_FLAGS:
+        deps[_RULE_DEP_FLAGS[_state_code]] = _result is not None
+```
+
+deps dict を Python の late-binding closure で参照 → `symbol_range` / `breakout_candidate` が呼ばれる時点で deps には前 rule の結果が入っている。
+
+#### `symbol_range` high ATR inactive diagnostic に `reason: "high_atr"` 追加
+
+- 旧: `{"status": "inactive", "atr_ratio": ...}`
+- 新: `{"status": "inactive", "reason": "high_atr", "atr_ratio": ...}`
+- `reason: "trending"` との区別が可能になった
+
+### テスト: `tests/test_phase_m.py` 追加（18件）
+
+| クラス | 件数 | 内容 |
+|---|---|---|
+| `TestRuleRegistry` | 6 | exists / is_tuple / 12 entries / unique / all codes / dep order |
+| `TestRuleDepFlags` | 4 | exists / 5 entries / flag values / keys in registry |
+| `TestEvaluateSymbolSingleLoop` | 5 | 12 codes in diagnostics / no data.get / deps propagation × 3 |
+| `TestSymbolRangeHighAtrReason` | 3 | high_atr reason / trending not high_atr / via evaluate_symbol |
+
+**テスト**: 1260 件全通過（1242 → 1260、+18件）
+
+### 変更ファイル
+
+| ファイル | 変更内容 |
+|---|---|
+| `trade_app/services/market_state/symbol_evaluator.py` | `_RULE_REGISTRY` / `_RULE_DEP_FLAGS` 追加・`symbol_range` high_atr reason 追加・`_evaluate_symbol()` single loop 書き換え |
+| `tests/test_phase_m.py` | **新規作成** 18件 |
+
+### rule 追加手順（Phase N 以降）
+
+新しい state rule を追加する場合:
+1. `_rule_新state名(ticker, data, *, params, make) -> tuple[StateEvaluationResult | None, dict]` を module レベルに追加
+2. `_RULES` リストに `("state_code", lambda t, d, ev, dp, et: _rule_新state名(t, d, ...))` を1行追加（依存順を考慮）
+3. 他 rule の結果に依存する場合は `_RULE_DEP_FLAGS` にフラグ名を追加し、lambda で `dp.get(flag, False)` を渡す
+
+`_RULE_REGISTRY` は `_RULES` から自動導出されるため手動追加不要。
+
+---
+
+## 今回の作業サマリー (2026-03-24 — Phase N: _RULES single source 化・二重管理解消)
+
+### 目的
+
+Phase M で `_RULE_REGISTRY`（文字列リスト）と `_evaluate_symbol()` 内 `_rules`（lambda リスト）が二重管理になっていた。Phase N でこれを `_RULES`（module レベルの実行定義リスト）1箇所に統合した。
+
+### 変更内容
+
+#### `symbol_evaluator.py`
+
+| 変更 | 内容 |
+|---|---|
+| `_RULE_REGISTRY` 手動定義を削除 | `_RULES` から自動導出するため不要 |
+| `_RULES: list[tuple[str, Any]]` 追加 | 全 `_rule_*()` 関数定義の直後（クラス定義前）に配置。各エントリ `(state_code, caller)` |
+| `_RULE_REGISTRY` 自動導出 | `tuple(code for code, _ in _RULES)` — `_RULES` と常に同期 |
+| `_evaluate_symbol()` 書き換え | ローカル `_rules` リスト廃止 → `for _state_code, _caller in _RULES:` の1行に統合 |
+| `_caller` シグネチャ | `(t, d, ev, dp, et)` — ticker, data, evaluator, deps, eval_time |
+| クラス docstring 更新 | `_RULES` が実行定義の唯一の場所であることを明記 |
+
+#### `_RULES` caller シグネチャ
+
+```python
+# caller: (t, d, ev, dp, et) → (StateEvaluationResult | None, diag)
+_RULES: list[tuple[str, Any]] = [
+    ("gap_up_open",         lambda t, d, ev, dp, et: _rule_gap_up_open(t, d, gap_threshold=ev.GAP_THRESHOLD, make=ev._make)),
+    ...
+    ("symbol_range",        lambda t, d, ev, dp, et: _rule_symbol_range(t, d, is_trend_up=dp.get("is_trend_up", False), ...)),
+    ("breakout_candidate",  lambda t, d, ev, dp, et: _rule_breakout_candidate(t, d, is_high_volume=dp.get("is_high_volume", False), ...)),
+]
+_RULE_REGISTRY: tuple[str, ...] = tuple(code for code, _ in _RULES)
+```
+
+**deps は `dp` として lambda パラメータで明示渡し**。Phase M の `deps.get()` closure 依存をなくし、モジュールレベルでも安全。
+
+#### 既存テスト修正（8件）
+
+`_evaluate_symbol()` ソースを見ていた構造テストを `inspect.getsource(_mod)` へ切り替え:
+- `test_phase_d.py::TestStructure::test_evaluate_symbol_has_no_spread_inline`
+- `test_phase_e.py::TestStructureOverextended::test_evaluate_symbol_has_no_rsi_inline`
+- `test_phase_f.py::TestStructureVolatilityHigh::test_evaluate_symbol_calls_rule`
+- `test_phase_h.py::TestStructureBreakout::test_evaluate_symbol_calls_rule_breakout_candidate`
+- `test_phase_i.py::TestStructureGap::test_evaluate_symbol_calls_gap_rules`
+- `test_phase_j.py::TestStructureVolume::test_evaluate_symbol_calls_volume_rules`
+- `test_phase_k.py::TestStructureTrend::test_evaluate_symbol_calls_trend_rules`
+- `test_phase_l.py::TestStructureRange::test_evaluate_symbol_calls_range_rule`
+
+### テスト: `tests/test_phase_n.py` 追加（20件）
+
+| クラス | 件数 | 内容 |
+|---|---|---|
+| `TestRulesList` | 5 | exists / is_list / 12 entries / (str, callable) pairs / codes match registry |
+| `TestRuleRegistryDerived` | 3 | equals derived / order matches / dep providers before consumers |
+| `TestEvaluateSymbolStructure` | 4 | no local _rules var / references _RULES / no data.get / 12 codes in diagnostics |
+| `TestBehaviorUnchanged` | 4 | dep propagation × 3 / price_stale eval_time |
+| `TestObservabilityUnchanged` | 4 | wide_spread active / high_atr reason / trending reason / all status keys |
+
+**テスト**: 1280 件全通過（1260 → 1280、+20件）
+
+### 変更ファイル
+
+| ファイル | 変更内容 |
+|---|---|
+| `trade_app/services/market_state/symbol_evaluator.py` | `_RULES` 追加・`_RULE_REGISTRY` 自動導出・`_evaluate_symbol()` 単純化 |
+| `tests/test_phase_n.py` | **新規作成** 20件 |
+| `tests/test_phase_d.py` | 構造テストのソース検索対象を `_mod` に変更 |
+| `tests/test_phase_e.py` | 同上 |
+| `tests/test_phase_f.py` | 同上 |
+| `tests/test_phase_h.py` | 同上 |
+| `tests/test_phase_i.py` | 同上 |
+| `tests/test_phase_j.py` | 同上 |
+| `tests/test_phase_k.py` | 同上 |
+| `tests/test_phase_l.py` | 同上 |
+
+---
+
+## 今回の作業サマリー (2026-03-24 — Phase O: activated state 通知連携)
+
+### 目的
+
+評価結果から activated かつ whitelist 内の state のみを抽出し、通知ディスパッチする経路を追加する。
+既存の評価・遷移保存・observability は変更しない。
+
+### 変更内容
+
+#### `engine.py` に追加した定数・関数
+
+| 定数 / 関数 | 内容 |
+|---|---|
+| `NOTIFIABLE_STATE_CODES: frozenset[str]` | 通知対象 state の whitelist（`wide_spread` / `price_stale` / `breakout_candidate`）|
+| `extract_notification_candidates(symbol_results, evaluation_time)` | `is_new_activation=True` かつ `NOTIFIABLE_STATE_CODES` に含まれる result を payload list として返す |
+| `dispatch_notifications(candidates)` | 各 payload を `logger.info("[NOTIFY] ...")` に流す。失敗は握りつぶす |
+
+#### `engine.run()` への組み込み
+
+`symbol_results` 確定後・`_save_symbol_transitions()` の前に以下を実行:
+```python
+try:
+    candidates = extract_notification_candidates(symbol_results, evaluation_time)
+    dispatch_notifications(candidates)
+except Exception:
+    pass  # 通知失敗は run 全体を失敗させない
+```
+
+#### 抽出条件
+
+1. `is_new_activation == True`
+2. `state_code ∈ NOTIFIABLE_STATE_CODES`
+
+#### payload 構造
+
+| キー | 全 state 共通 |
+|---|---|
+| `ticker` | `r.target_code` |
+| `state_code` | `r.state_code` |
+| `evaluation_time` | 引数の `evaluation_time` |
+| `reason` | `r.evidence.get("reason")` |
+| `score` | `r.score` |
+
+state 別追加:
+- `wide_spread`: `spread`, `spread_rate`, `current_price`
+- `price_stale`: `last_updated`, `age_sec`, `threshold_sec`
+- `breakout_candidate`: 追加なし（score のみ）
+
+### テスト: `tests/test_phase_o.py` 追加（29件）
+
+| クラス | 件数 | 内容 |
+|---|---|---|
+| `TestExtractionFilter` | 6 | activated 抽出 / continued 除外 / whitelist 外除外 / 3件同時 / 混在 / 空リスト |
+| `TestPayloadRequiredKeys` | 6 | 必須キー存在 / ticker / eval_time / score / reason / reason=None |
+| `TestStateSpecificPayload` | 7 | wide_spread extras / price_stale extras / breakout score / フィールド混入なし |
+| `TestDispatchNotifications` | 3 | 例外握りつぶし / 継続処理 / 空リスト |
+| `TestNotifiableStateCodes` | 7 | frozenset / 3件 / 各 state 存在 / 非 whitelist |
+
+**テスト**: 1309 件全通過（1280 → 1309、+29件）
+
+### 変更ファイル
+
+| ファイル | 変更内容 |
+|---|---|
+| `trade_app/services/market_state/engine.py` | `NOTIFIABLE_STATE_CODES` / `extract_notification_candidates` / `dispatch_notifications` 追加・`run()` に通知処理組み込み |
+| `tests/test_phase_o.py` | **新規作成** 29件 |
+
+---
+
+## 今回の作業サマリー (2026-03-24 — Phase P: quote_only rule 追加)
+
+### 目的
+
+「気配はあるが約定価格がない」状態を検出する `quote_only` rule を追加する。
+既存 state の判定ロジック・通知対象・repository は変更しない。
+
+### 変更内容
+
+#### `_rule_quote_only()` 追加（`symbol_evaluator.py`）
+
+```
+signature: (ticker, data, *, make: _MakeFn) -> tuple[StateEvaluationResult | None, dict]
+```
+
+| 条件 | 結果 |
+|---|---|
+| `current_price is not None` | inactive / `reason: "has_last_price"` |
+| `current_price is None` AND `best_bid=None` AND `best_ask=None` | inactive / `reason: "no_quotes"` |
+| `current_price is None` AND (`best_bid` or `best_ask` が存在) | **active** / `score=1.0` |
+
+evidence (active 時): `reason / current_price / best_bid / best_ask / has_bid / has_ask`
+
+#### `_RULES` に1行追加
+
+```python
+("quote_only", lambda t, d, ev, dp, et: _rule_quote_only(t, d, make=ev._make)),
+```
+
+`_RULE_REGISTRY` は自動導出のため手動追加不要。依存フラグなし（独立 rule）。
+
+#### 通知対象: 追加しない
+
+`NOTIFIABLE_STATE_CODES` に `quote_only` は含めない（仕様）。
+
+#### 既存テスト修正
+
+| ファイル | 変更内容 |
+|---|---|
+| `tests/test_phase_g.py` | `_RULE_KEYS` に `"quote_only"` 追加（12 → 13 キー）|
+| `tests/test_phase_m.py` | `test_has_12_entries` → `test_has_13_entries` |
+| `tests/test_phase_n.py` | `test_has_12_entries` → `test_has_13_entries`、docstring 更新 |
+
+### テスト: `tests/test_phase_p.py` 追加（29件）
+
+| クラス | 件数 | 内容 |
+|---|---|---|
+| `TestRuleQuoteOnlyDirect` | 13 | active × 3 / inactive × 4 / score / evidence × 3 / diag |
+| `TestOrchestratorQuoteOnly` | 4 | active / no quote_only × 2 / 共存 |
+| `TestStructureQuoteOnly` | 4 | module level / registry / _RULES / count=13 |
+| `TestQuoteOnlyTransitions` | 4 | initial / continued / deactivation / reactivation |
+| `TestQuoteOnlyDiagnostic` | 4 | active / has_last_price / no_quotes / key 存在 |
+| `TestQuoteOnlyNotification` | 1 | NOTIFIABLE_STATE_CODES に含まれない |
+
+**テスト**: 1338 件全通過（1309 → 1338、+29件）
+
+### 変更ファイル
+
+| ファイル | 変更内容 |
+|---|---|
+| `trade_app/services/market_state/symbol_evaluator.py` | `_rule_quote_only()` 追加・`_RULES` に1行追加 |
+| `tests/test_phase_p.py` | **新規作成** 29件 |
+| `tests/test_phase_g.py` | `_RULE_KEYS` に `"quote_only"` 追加 |
+| `tests/test_phase_m.py` | 件数チェック 12 → 13 |
+| `tests/test_phase_n.py` | 件数チェック 12 → 13・docstring 更新 |
+
+---
+
+## stale_bid_ask shadow hard guard 観測系 — Phase W〜AE 完了記録
+
+### 観測系の目的
+
+stale_bid_ask を将来 hard guard に昇格させるかどうかを判断するための観測 infrastructure。
+Phase W〜AD で実装し、Phase AE で凍結した。
+
+**本番挙動への影響: なし**（hard guard は price_stale のみ。stale_bid_ask は reject しない）
+
+### 実装フェーズ一覧
+
+| フェーズ | 追加 stage / 機能 | テスト |
+|---|---|---|
+| Phase W | `shadow_hard_guard_decision` イベントを trace に記録（reject しない） | 19件 |
+| Phase X | `shadow_hard_guard_assessment` 派生 entry（shadow event 集約） | 34件 |
+| Phase Y | `shadow_hard_guard_review_summary` 派生 entry（promotion_readiness） | 36件 |
+| Phase Z | `upsert_trace_stage` 正規化 helper / 重複防止 / 読み出し helper 統一 | 33件 |
+| Phase AA | `shadow_hard_guard_promotion_metrics` 派生 entry（overlap / advisory / weight） | 37件 |
+| Phase AB | `shadow_hard_guard_promotion_decision` 派生 entry（4値 provisional decision） | 29件 |
+| Phase AC | `shadow_hard_guard_aggregate_review_key` 派生 entry（集計用分類キー） | 45件 |
+| Phase AD | `shadow_hard_guard_aggregate_review_verdict` 派生 entry（verdict ラベル） | 34件 |
+| Phase AE | 役割固定・昇格判定基準明文化・次フェーズ方針凍結（コードなし） | — |
+
+**テスト累計**: Phase W〜AD で 267件追加（全体 1766件）
+
+### 派生 stage 一覧（Phase AE 確定）
+
+source events / source inputs:
+- `shadow_hard_guard_decision`: shadow event 本体（Phase W）
+- `execution_guard_hints`: blocking/warning reason 入力（PlannerContext）
+- `advisory_guard_assessment`: advisory guard 評価（Phase U）
+
+derived stages（再計算可能・hard guard 判定には使わない）:
+
+| stage | 役割 | 主要フィールド |
+|---|---|---|
+| `shadow_hard_guard_assessment` | shadow event 集約 | has_shadow_candidate / would_reject_candidates / event_count |
+| `shadow_hard_guard_review_summary` | 簡易レビュー要約 | promotion_readiness: "no_signal" / "observe" / "needs_review" |
+| `shadow_hard_guard_promotion_metrics` | 昇格判断用基礎観測値 | overlaps_with_price_stale / has_advisory_guard / promotion_signal_weight |
+| `shadow_hard_guard_promotion_decision` | provisional decision | decision: "no_signal" / "observe" / "hold" / "review_priority" |
+| `shadow_hard_guard_aggregate_review_key` | 集計用分類キー | shadow/overlap/advisory/decision bucket / countable |
+| `shadow_hard_guard_aggregate_review_verdict` | 集計結果 verdict ラベル | verdict: "insufficient_signal" / "observe_only" / "overlap_hold" / "priority_review" |
+
+### stale_bid_ask 昇格判定基準（Phase AE 確定）
+
+以下の観点をすべて確認してから昇格判断を行うこと。
+
+| # | 確認観点 |
+|---|---|
+| 1 | `countable=True` の母数が十分あること（verdict="priority_review" / "overlap_hold" 累積件数） |
+| 2 | `overlap_bucket="distinct_from_price_stale"` が一定割合あること（price_stale の代替指標でないこと） |
+| 3 | `decision_bucket="review_priority"` が複数セッションにわたり継続して観測されること |
+| 4 | `advisory_bucket` の分布が偏っていないこと（すべて blocking / すべて none は要解釈） |
+| 5 | 誤検知懸念が強い場合は昇格しないこと |
+| 6 | 本番 reject 影響の事前評価が完了するまでは observe 継続可能 |
+
+レビュー結論ラベル（運用概念。現時点では trace には追加しない）:
+- `promote_candidate`: 昇格条件をすべて満たした
+- `hold_observation`: 観測継続（evidence 不足 / 誤検知懸念あり）
+- `insufficient_evidence`: 母数不足でレビュー判断不能
+
+### 今後の方針（Phase AE 凍結）
+
+**Phase AE をもって shadow hard guard 観測系の実装を完了とする。**
+
+次にやること:
+- 観測データを集計し昇格判定基準を確認する（**review フェーズ**）
+- 昇格判断が出た場合のみ stale_bid_ask を hard guard 化する
+
+次にやらないこと:
+- 新たな derived stage の追加（原則禁止）
+- reject ロジックの変更（昇格判断確定まで禁止）
+- planning_trace_json の構造変更
+
+---
+
+*最終更新: 2026-03-26 / Phase AE — stale_bid_ask 観測系完了・昇格判定基準凍結 / テスト 1766 件全通過*
+
+---
+
+## stale_bid_ask shadow hard guard — review report template（Phase AF 確定）
+
+**このセクションは以後の review 報告で必ず使うテンプレートである。**
+実装報告ではなく「review 報告」として扱う。
+数値がまだない項目は "未集計" と明示する。推測で埋めない。
+根拠のない `promote_candidate` 結論は禁止。
+
+---
+
+### shadow hard guard review report
+
+```
+対象 candidate : stale_bid_ask
+観測期間       : YYYY-MM-DD 〜 YYYY-MM-DD
+
+母数
+  total signals     :
+  countable=true    :
+  countable=false   :
+
+shadow_bucket 分布
+  no_signal         :
+  triggered_only    :
+  would_reject      :
+
+overlap_bucket 分布
+  no_overlap                :
+  overlaps_price_stale      :
+  distinct_from_price_stale :
+
+advisory_bucket 分布
+  none     :
+  warning  :
+  blocking :
+
+decision_bucket 分布
+  no_signal       :
+  observe         :
+  hold            :
+  review_priority :
+
+aggregate_review_verdict 分布
+  insufficient_signal :
+  observe_only        :
+  overlap_hold        :
+  priority_review     :
+
+重点確認
+  1. distinct_from_price_stale の割合は十分か
+  2. review_priority は複数セッションで継続しているか
+  3. overlap_hold 偏重ではないか
+  4. advisory_bucket に極端な偏りはないか
+  5. 誤検知が疑われる事例はあるか
+  6. hard reject 化した場合の本番影響は許容可能か
+
+レビュー結論
+  [ ] promote_candidate   — 昇格条件をすべて満たした
+  [ ] hold_observation    — 観測継続（evidence 不足 / 誤検知懸念あり）
+  [ ] insufficient_evidence — 母数不足でレビュー判断不能
+
+結論理由
+  -
+
+次アクション
+  [ ] 継続観測
+  [ ] 追加集計
+  [ ] 昇格検討開始
+```
+
+---
+
+### review 報告ルール（Phase AF 確定）
+
+| ルール | 内容 |
+|---|---|
+| フォーマット | 上記テンプレートを必ず使う |
+| 数値未集計時 | 各項目を "未集計" と明示する。推測で埋めない |
+| 結論 | 観測根拠が十分な場合のみ `promote_candidate` を使う |
+| 禁止 | 根拠のない昇格提案、テンプレートを省略した報告 |
+| 適用範囲 | stale_bid_ask に関する全ての review 報告 |
+
+---
+
+## 今回の作業サマリー (2026-03-27 — Phase AM/AN: p_errno=2 セッション切断の自動再ログイン修正)
+
+### Phase AM — 原因調査
+
+**観察事実:**
+- `MarketStateRunner` ログに `SymbolDataFetcher: ticker=7203 市場データ取得失敗 — この ticker はスキップ: p_errno=2 url=...` が継続記録
+- コンテナ内から直接 `sUrlPrice` エンドポイントに HTTP リクエストを送信し、生レスポンスを確認:
+  ```json
+  {"287":"2","286":"セッションが切断しました。","334":"CLMMfdsGetMarketPrice"}
+  ```
+- `p_errno=2` は demo API 仕様制約ではなく**セッション切断**（サーバー側タイムアウト）
+- セッション有効期限実測: 41分（2026-03-24 11:22→12:03）〜約10時間（2026-03-23 21:49→2026-03-24 08:30）
+- ログ確認: 2026-03-25 15:04:47 に `current_price=3346.0` を正常取得している（再起動後は動く）
+
+**根本原因:**
+`_P_ERRNO_AUTH_CODES = frozenset({10001})` に `2` が含まれていなかったため:
+- `p_errno=2` → `BrokerAPIError` を送出（`BrokerAuthError` にならない）
+- `adapter.get_market_data()` が `BrokerAuthError` を catch して `session.invalidate()` を呼ぶ経路が通らない
+- `ensure_session()` は `is_usable=True` のまま → 再ログインしない
+- 結果: 永続的にセッション切断状態でデータ取得失敗が継続
+
+### Phase AN — 修正内容
+
+#### `trade_app/brokers/tachibana/client.py` 変更（1箇所）
+
+```python
+# Before
+_P_ERRNO_AUTH_CODES: frozenset[int] = frozenset({
+    10001,   # 暫定: セッション認証エラー（再ログイン必要）
+})
+
+# After
+_P_ERRNO_AUTH_CODES: frozenset[int] = frozenset({
+    2,       # セッション切断（実測: p_err_msg="セッションが切断しました。"）→ 再ログイン必要
+    10001,   # 暫定: セッション認証エラー（再ログイン必要）
+})
+```
+
+**修正後の動作フロー:**
+1. `p_errno=2` → `_check_p_errno()` → `BrokerAuthError` 送出
+2. `adapter.get_market_data()` が `BrokerAuthError` を catch → `_handle_auth_error()` → `session.invalidate()`
+3. `is_usable=False` になる
+4. 次サイクルの `ensure_session()` → `_do_login()` → 新しいセッション + 新しい `sUrlPrice` を取得
+5. `get_market_data()` が新 URL で成功
+
+#### テスト: `tests/test_tachibana_client_p_errno.py` 追加（9件）
+
+| クラス | 件数 | 内容 |
+|---|---|---|
+| `TestCheckPErrno` | 7 | p_errno=2→BrokerAuthError / p_errno=10001→BrokerAuthError / p_errno=0→正常 / 欠損→正常 / p_errno=99→BrokerAPIError / 整数値2→BrokerAuthError / URL がメッセージに含まれる |
+| `TestAdapterInvalidatesOnPErrno2` | 2 | BrokerAuthError → invalidate() 呼び出し / BrokerAPIError → invalidate() 呼ばれない |
+
+**テスト**: 1775 件全通過（1766 → 1775、+9件）
+
+### 変更ファイル一覧
+
+| ファイル | 変更内容 |
+|---|---|
+| `trade_app/brokers/tachibana/client.py` | `_P_ERRNO_AUTH_CODES` に `2` を追加・`_check_p_errno` コメント更新 |
+| `tests/test_tachibana_client_p_errno.py` | **新規作成** 9件 |
+
+---
+
+*最終更新: 2026-03-26 / Phase AK — market-hours entry smoke test runbook 確定*
+
+---
+
+## Phase AK — market-hours entry smoke test runbook（2026-03-26 確定）
+
+> **このセクションは次の市場時間（JST 09:15–11:30）にそのまま実施できる runbook である。**
+> コード変更・新 stage 追加・DB schema 変更は一切行わない。
+> hard guard は price_stale のみ。stale_bid_ask は reject しない。実時刻判定の前提を崩さない。
+
+---
+
+### 背景・現状ブロッカー（Phase AJ 確定）
+
+| ブロッカー | 詳細 | 解消条件 |
+|---|---|---|
+| `after_hours` | JST 23:00 現在、`time_window=after_hours` → `long_morning_trend` 通過不可 | JST 09:15–11:30 内での稼働 |
+| `market=range` | 日経平均変動率 < ±0.5% → `trend_down` 条件を満たせず `short_risk_off_rebound` 通過不可 | 日経平均 ±0.5% 超の継続変動 |
+| symbol データ空 | Tachibana demo API が `p_errno=2` を返す → `symbol_trend_up` / `symbol_volatility_high` が active にならない（`active_states=[]`） | Tachibana API 本番接続 or demo API symbol 取得方法の確認 |
+
+**Gate 通過が現在不可能であっても Planning Layer 自体は正常（Phase AI exit path で 9 derived stages 含む trace 保存を実証済み）。**
+
+---
+
+### A. 実行前チェック
+
+#### A-1. 時刻確認
+
+```bash
+TZ='Asia/Tokyo' date
+# → JST 09:15–11:30 内であること
+# 範囲外なら long_morning_trend は通過しない（after_hours/opening_auction_risk/midday_low_liquidity）
+```
+
+#### A-2. コンテナ稼働確認
+
+```bash
+cd /home/alma/trade-system
+docker compose ps
+# → trade_app / postgres / redis が全て Up (healthy) であること
+```
+
+#### A-3. API 疎通確認
+
+```bash
+curl -s http://localhost:8000/health
+# → {"status":"ok"} であること
+```
+
+#### A-4. 現在の signal_plans / trade_signals 件数（実行前ベースライン）
+
+```bash
+docker exec trade-system-postgres-1 psql -U trade trade_db -c "
+SELECT
+  (SELECT COUNT(*) FROM signal_plans) as signal_plans_before,
+  (SELECT COUNT(*) FROM trade_signals WHERE signal_type='entry') as entry_signals_before;"
+```
+
+#### A-5. market regime 確認（Gate 通過可否）
+
+```bash
+curl -s -H "Authorization: Bearer changeme_before_production" \
+  http://localhost:8000/api/v1/market-state/current \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); [print(x['layer'],x['active_states']) for x in d]"
+
+# long_morning_trend が通るために必要:
+#   time_window: ["morning_trend_zone"]
+#   market: ["range"] または ["normal"] (risk_off でなければ OK)
+#
+# short_risk_off_rebound が通るために必要:
+#   market: ["trend_down"]
+#   time_window: midday_low_liquidity でなければ OK
+```
+
+#### A-6. symbol データ取得可否確認
+
+```bash
+curl -s -H "Authorization: Bearer changeme_before_production" \
+  http://localhost:8000/api/v1/market-state/symbols/7203 \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print('active_states:', d['active_states'])"
+
+# active_states が空 [] なら symbol データ未取得
+# active_states に "symbol_trend_up" が含まれれば long_morning_trend の symbol 条件が通る
+```
+
+#### A-7. Gate 通過可否の最終確認
+
+```bash
+curl -s -H "Authorization: Bearer changeme_before_production" \
+  http://localhost:8000/api/v1/strategies/latest \
+  | python3 -c "
+import sys, json
+decisions = json.load(sys.stdin)
+for d in decisions:
+    if d['ticker'] is None:
+        print(d['strategy_code'], 'entry_allowed:', d['entry_allowed'], 'blocking:', d.get('blocking_reasons',[]))"
+
+# entry_allowed: true のものが1つ以上あれば Gate 通過可能
+```
+
+---
+
+### B. 実行コマンド（manual entry smoke test）
+
+> **実施タイミング: JST 09:15–11:30 内、A-1〜A-7 が全て OK になってから実施すること。**
+> analysis system からの自動送信がなくても、手動 POST でエンドポイントを直接叩く。
+
+#### B-1. long_morning_trend 向け（BUY entry）
+
+```bash
+IDEM_KEY=$(python3 -c "import uuid; print(uuid.uuid4())")
+curl -s -X POST http://localhost:8000/api/signals \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer changeme_before_production" \
+  -H "Idempotency-Key: $IDEM_KEY" \
+  -H "X-Source-System: manual-smoke-test" \
+  -d '{
+    "ticker": "7203",
+    "signal_type": "entry",
+    "order_type": "market",
+    "side": "buy",
+    "quantity": 100,
+    "generated_at": "'"$(python3 -c "from datetime import datetime,timezone; print(datetime.now(timezone.utc).isoformat())")"'"
+  }' | python3 -m json.tool
+```
+
+※ `generated_at` は Gate 判定に**影響しない**（Gate はサーバー現在時刻で評価）。正しい現在時刻を渡しておくことで audit trail を正確に保つ。
+
+#### B-2. short_risk_off_rebound 向け（SELL entry）
+
+```bash
+IDEM_KEY=$(python3 -c "import uuid; print(uuid.uuid4())")
+curl -s -X POST http://localhost:8000/api/signals \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer changeme_before_production" \
+  -H "Idempotency-Key: $IDEM_KEY" \
+  -H "X-Source-System: manual-smoke-test" \
+  -d '{
+    "ticker": "7203",
+    "signal_type": "entry",
+    "order_type": "market",
+    "side": "sell",
+    "quantity": 100,
+    "generated_at": "'"$(python3 -c "from datetime import datetime,timezone; print(datetime.now(timezone.utc).isoformat())")"'"
+  }' | python3 -m json.tool
+```
+
+---
+
+### C. 成功条件
+
+| 確認項目 | 確認コマンド | 成功条件 |
+|---|---|---|
+| HTTP レスポンス | curl 結果 | `202 Accepted` / `{"signal_id": "...", "status": "accepted"}` |
+| trade_signals 増加 | 下記 SQL | `status='accepted'` のレコードが 1 件増加 |
+| signal_plans 増加 | 下記 SQL | `planning_status='accepted'` または `'reduced'` のレコードが 1 件増加 |
+| planning_trace_json 保存 | 下記 SQL | 10 stages 以上（planning steps 8 + derived stages 8） |
+| execution_guard_hints 保存 | 下記 SQL | trace 内 `stage=execution_guard_hints` が存在 |
+| derived stages 保存 | 下記 SQL | `stage=shadow_hard_guard_aggregate_review_verdict` が存在 |
+
+#### C-1. 確認 SQL（実行後に走らせる）
+
+```bash
+# trade_signals の最新 entry レコード確認
+docker exec trade-system-postgres-1 psql -U trade trade_db -c "
+SELECT id, ticker, side, status, rejection_reason,
+       created_at AT TIME ZONE 'Asia/Tokyo' as created_jst
+FROM trade_signals
+WHERE signal_type='entry'
+ORDER BY created_at DESC
+LIMIT 3;"
+
+# signal_plans の最新レコード確認
+docker exec trade-system-postgres-1 psql -U trade trade_db -c "
+SELECT id, planning_status, planned_order_qty, rejection_reason_code,
+       jsonb_array_length(planning_trace_json::jsonb) as trace_stages,
+       created_at AT TIME ZONE 'Asia/Tokyo' as created_jst
+FROM signal_plans
+ORDER BY created_at DESC
+LIMIT 3;"
+
+# 最新 signal_plan の trace stages 一覧
+docker exec trade-system-postgres-1 psql -U trade trade_db -c "
+SELECT elem->>'stage' as stage,
+       elem->>'decision' as decision,
+       elem->>'verdict' as verdict,
+       elem->>'guard_level' as guard_level
+FROM signal_plans,
+     jsonb_array_elements(planning_trace_json::jsonb) AS elem
+WHERE id = (SELECT id FROM signal_plans ORDER BY created_at DESC LIMIT 1);"
+```
+
+#### C-2. execution_guard_hints の内容確認
+
+```bash
+docker exec trade-system-postgres-1 psql -U trade trade_db -c "
+SELECT elem->'hints' as execution_guard_hints
+FROM signal_plans,
+     jsonb_array_elements(planning_trace_json::jsonb) AS elem
+WHERE id = (SELECT id FROM signal_plans ORDER BY created_at DESC LIMIT 1)
+  AND elem->>'stage' = 'execution_guard_hints';"
+```
+
+---
+
+### D. 失敗時の切り分け
+
+#### D-1. after_hours で Gate reject
+
+```
+症状: trade_signals.status='rejected', rejection_reason LIKE '%decision_blocked:global:long_morning_trend%'
+      OR '%morning_trend_zone%'
+確認: TZ='Asia/Tokyo' date で 09:15–11:30 外
+対応: 時間外。市場時間まで待機。
+```
+
+#### D-2. market=range で Gate reject
+
+```
+症状: trade_signals.status='rejected', rejection_reason LIKE '%decision_blocked:global:short_risk_off_rebound%'
+      OR '%trend_down%'
+確認: GET /api/v1/market-state/current で market: ["range"]
+対応: 日経平均変動率が ±0.5% 以上になるのを待機。observation のみ。
+```
+
+#### D-3. symbol データ欠損で Gate reject
+
+```
+症状: trade_signals.status='rejected', rejection_reason LIKE '%symbol_trend_up%' OR '%symbol_volatility_high%'
+確認: GET /api/v1/market-state/symbols/7203 で active_states=[]
+対応: Tachibana API p_errno=2 の解消を待機（下記 D 章「Tachibana demo API 制約」参照）
+```
+
+#### D-4. Authorization / Idempotency-Key / API 契約不一致
+
+```
+症状: 401 Unauthorized / 422 Unprocessable Entity / 400 Bad Request
+確認: curl の -H ヘッダーを再確認。Idempotency-Key は UUID v4 形式。
+      ticker は数字のみ（'7203' OK / '7203.T' NG）
+      order_type=market の場合 limit_price 不要
+対応: ヘッダー・ボディを修正して再実行（Idempotency-Key は毎回新しい UUID を生成）
+```
+
+#### D-5. Gate reject（signal_plans に記録なし）
+
+```
+症状: trade_signals.status='rejected', signal_plans 増加なし
+確認: signal.status が 'rejected' で signal.rejection_reason が "strategy gate rejected: ..."
+対応: Gate 段階で弾かれた（Planning Layer 未到達）。A-7 の Gate 通過可否を再確認。
+```
+
+#### D-6. Planning が rejected で signal_plans は増加している
+
+```
+症状: signal_plans.planning_status='rejected'
+確認: signal_plans.rejection_reason_code を確認
+      EXECUTION_GUARD_PRICE_STALE → price_stale hard guard が発動
+      PLANNED_SIZE_ZERO → サイズ計算の結果 0 株になった
+対応: execution_guard_hints の blocking_reasons を確認。price_stale の場合はデータ鮮度問題。
+```
+
+#### D-7. 保存失敗（アプリログ確認）
+
+```bash
+docker compose logs trade_app --tail=50 | grep -E "ERROR|WARNING|exception|Traceback"
+```
+
+---
+
+### Tachibana demo API 制約の解釈ルール（Phase AK 確定）
+
+#### 現状
+
+| 観点 | 内容 |
+|---|---|
+| 現象 | Tachibana demo API が symbol data fetch 時に `p_errno=2` を返す |
+| 結果 | `symbol_data_fetcher` が有効データを取得できない → symbol snapshot の `active_states=[]` |
+| 影響 | `symbol_trend_up` / `symbol_volatility_high` が active にならない → Gate が entry を通過させない |
+
+#### 未確定事項
+
+| 事項 | 状態 |
+|---|---|
+| `p_errno=2` が demo API の仕様制約か、実装不備か | **未確定** |
+| demo API で symbol データを正しく取得する方法があるか | **未調査** |
+| 本番 API で解消するか | **未確認** |
+
+#### 解釈ルール（運用上の分類）
+
+entry smoke test で `signal_plans` に `no_signal` または Gate reject になった場合:
+
+| ケース | 解釈 | stale_bid_ask 観測可否 |
+|---|---|---|
+| symbol data 取得失敗（`active_states=[]`）かつ Gate reject | **観測不能** — symbol 条件が充足されないため Gate を通過しない | 不可 |
+| symbol data 取得成功・Gate pass・`execution_guard_hints.blocking_reasons=[]` | **正常 no_signal** — stale_bid_ask が発火しなかった（正常） | 観測可能（no_signal） |
+| symbol data 取得成功・Gate pass・`blocking_reasons=["stale_bid_ask"]` | **shadow 観測対象** — stale_bid_ask が shadow event として記録される | 観測可能（would_reject 候補） |
+
+**重要:** `p_errno=2` が継続する限り、stale_bid_ask の観測は「観測不能」状態に留まる。
+解消方法が判明した時点で別途 runbook を更新すること。
+
+---
+
+### 次回市場時間チェックリスト（Phase AK 確定）
+
+実施日時: ___________（JST 09:15–11:30 内に記入）
+
+```
+事前確認（実行前）
+[ ] JST 09:15–11:30 内 — TZ='Asia/Tokyo' date で確認
+[ ] trade_app 稼働 — docker compose ps で Up 確認
+[ ] postgres / redis healthy — (healthy) 表示確認
+[ ] API token 確認 — curl http://localhost:8000/health → {"status":"ok"}
+[ ] signal_plans ベースライン件数記録 — 実行前カウント: ___ 件
+[ ] trade_signals(entry) ベースライン件数記録 — 実行前カウント: ___ 件
+[ ] market regime 確認 — GET /api/v1/market-state/current
+    time_window: _____________  （morning_trend_zone なら long_morning_trend が通る可能性あり）
+    market: _____________       （trend_down なら short_risk_off_rebound が通る可能性あり）
+[ ] symbol データ取得可否確認 — GET /api/v1/market-state/symbols/7203
+    active_states: _____________（[] なら Tachibana p_errno=2 継続）
+[ ] Gate 通過可否確認 — GET /api/v1/strategies/latest
+    entry_allowed=true の strategy: _____________（なければ Gate reject 確定）
+
+実行
+[ ] manual entry POST 実行 — B-1（BUY）または B-2（SELL）を IDEM_KEY を新規生成して実行
+    HTTP レスポンス: _____________（202 なら受付）
+
+実行後確認
+[ ] trade_signals 保存確認 — C-1 SQL で status 確認
+    status: _____________（accepted / rejected）
+    rejection_reason（rejected 時）: _____________
+[ ] signal_plans 保存確認 — C-1 SQL で planning_status 確認
+    planning_status: _____________（accepted / reduced / rejected）
+    trace_stages 件数: _____________（expected: 16 以上 for entry）
+[ ] planning_trace_json 保存確認 — C-1 SQL でステージ一覧確認
+    stage=execution_guard_hints: [ ] あり  [ ] なし
+    stage=shadow_hard_guard_aggregate_review_verdict: [ ] あり  [ ] なし
+[ ] execution_guard_hints 内容確認 — C-2 SQL で blocking_reasons 確認
+    has_quote_risk: _____________
+    blocking_reasons: _____________（[] なら stale_bid_ask なし）
+[ ] shadow 系 stage 値確認
+    shadow_bucket: _____________（no_signal / triggered_only / would_reject）
+    overlap_bucket: _____________
+    decision_bucket: _____________
+    verdict: _____________（insufficient_signal / observe_only / overlap_hold / priority_review）
+[ ] stale_bid_ask 観測可否判定
+    [ ] symbol データ取得成功かつ Gate pass → 観測可能 → verdict を記録
+    [ ] symbol データ空（p_errno=2）→ 観測不能 → Tachibana API 制約として記録
+      ※ Phase AN 修正後は p_errno=2 で自動再ログインするため、次回実行時は観測可能になる見込み
+```
+
+---
+
+## 今回の作業サマリー (2026-03-27 — Phase AO/AL/AP/AQ/AR-2: demo limitation freeze)
+
+### Phase AO 完了（symbol data recovery verification）
+
+**実測確認（JST 10:48 / Phase AN 修正後）:**
+- `get_market_data("7203")`: current_price=3414.0, best_bid=3413.0, best_ask=3414.0 ✅
+- `get_market_data("6758")`: current_price=3222.0, best_bid=3222.0, best_ask=3223.0 ✅
+- `SymbolDataFetcher.fetch(["7203","6758"])`: keys=['7203','6758']（非空）✅
+- p_errno=2 → BrokerAuthError → session.invalidate() → 再ログイン → 新 sUrlPrice 取得 ✅
+
+### Phase AL 結果（market-hours manual entry smoke test）
+
+- 実施: JST 11:07 頃に manual entry POST（ticker=7203, side=buy）
+- 結果: Gate reject（`signal.status='rejected'`）
+- 原因: `symbol_trend_up` が `missing_required_state` — symbol active_states=[] のため
+- 根因: demo API が MA / ATR を返さないため symbol rule が全て skipped → active_states 永続的空
+
+### Phase AP 結果（demo API sTargetColumn coverage 実測）
+
+**demo API で取得可能（実測確認）:**
+
+| sTargetColumn | numeric key | 内容 |
+|---|---|---|
+| `pDPP` | 115 | 現在値 |
+| `pQBP` | 184 | 最良買気配値 |
+| `pQAP` | 182 | 最良売気配値 |
+| `pVWAP` | 213 | 当日 VWAP（実測: 3375.4〜3375.9 for 7203）|
+| `pAV` | 99 | 出来高系（実測: 5300〜12300 / 種別未確定）|
+
+**demo API で取得不能（key 認識されるが値が空）:**
+- MA 系: `pMA5`, `pMA25`, `pMA75`
+- テクニカル指標: `pATR`, `pRSI`, `pRS`
+- 始値・高値・安値: `pOP`, `pHIP`, `pLOP`
+- 前日終値・前週終値: `pPCP`, `pYCP`
+
+**分類:**
+- `pVWAP` / `pAV`: demo API は返すが adapter/mapper/MarketData が未対応 → **実装不足**
+- MA / ATR / RSI / open / prev_close 系: demo API 自体が空を返す → **demo API 制約**
+
+### Phase AQ 結論（demo-passable strategy path verification）
+
+既存 strategy（`long_morning_trend` / `short_risk_off_rebound`）の条件を棚卸し、demo coverage との突合を実施。
+
+**`long_morning_trend`（direction=long）の required_state:**
+1. `time_window: morning_trend_zone` — JST 09:15–11:30 内で充足可能
+2. `symbol: symbol_trend_up` — `price > vwap AND ma5 > ma20` 必須 → `ma5` / `ma20` が demo 制約で取得不能 → **永続的 missing**
+
+**`short_risk_off_rebound`（direction=short）の required_state:**
+1. `market: trend_down` — index_change_pct < −0.5% で充足可能
+2. `symbol: symbol_volatility_high` — `atr / current_price >= 0.02` 必須 → `atr` が demo 制約で取得不能 → **永続的 missing**
+
+**結論: demo 環境では既存 strategy の Gate 通過経路なし（2策略とも symbol-layer required_state でブロック）**
+
+`pVWAP` を adapter に追加しても `long_morning_trend` の通過には不十分（`ma5` / `ma20` が残るため `symbol_trend_up` は skipped のまま）。
+
+### Phase AR-2: demo limitation freeze（確定記録）
+
+#### 再開条件
+
+以下のいずれかが満たされるまで、Phase AL 以上（manual entry smoke test / Gate 通過確認）は保留:
+
+| 条件 | 内容 |
+|---|---|
+| A | 本番 API 接続で `pMA5` / `pMA25` / `pATR` 等が有効な値を返す |
+| B | 外部計算（日次バッチ / 時系列 DB）で `ma5` / `ma20` / `atr` を symbol state 入力として供給できる |
+
+条件 A または B が充足された時点で Phase AL を再開し、market-hours manual entry smoke test を実施する。
+
+#### backlog タスク（優先度低・保留）
+
+| タスク | 内容 | 着手条件 |
+|---|---|---|
+| Phase AR-1 | `pVWAP` / `pAV` ingestion 実装（adapter / mapper / MarketData 拡張）| 再開条件 A または B とは独立。Gate 通過保証には直結しないため今は保留 |
+| `pAV` 種別確定 | key=99 の値が株数か株数/100か累積か確認 | AR-1 着手前に確認要 |
+
+#### 禁止事項（確定）
+
+- strategy seed を demo 環境通過目的で変更しない
+- demo 制約回避のために rule の guard 条件を緩めない
+- 再開条件未充足のまま AL 以降の smoke test を反復しない
+
+---
+
+*最終更新: 2026-03-27 / Phase AR-2 — demo limitation freeze 確定 / 再開条件明文化 / テスト 1775 件全通過*
+
+---
+
+## 今回の作業サマリー (2026-03-27 — Phase AS-2/AT: 日次メトリクス設計・実装)
+
+### Phase AS-2 設計承認事項（条件付き承認）
+
+| 決定項目 | 採用案 |
+|---|---|
+| 日次データ供給元 | **J-Quants**（TSE公式・無料プラン・過去データ即時取得可）|
+| 保存方式 | **新テーブル `daily_price_history`**（方式A）|
+| DB schema 変更 | **必要**（migration 014 を新設）|
+| 計算方式 | アプリ側でウィンドウ計算（MA/ATR/RSI）。DBには raw OHLCV のみ保存 |
+| stale 判定 | `rows[0].trading_date < today_jst - 4日` → 全 None（部分利用禁止）|
+| vwap 対応 | 本フェーズ対象外（mapper 追加は別フェーズ）|
+| Tachibana API | 日次 OHLCV エンドポイントなし（リアルタイム配信のみ）→ 主供給元として除外 |
+| yfinance | 非公式 → 本番不適として除外 |
+
+### Phase AT 実装内容
+
+| 実装内容 | 詳細 |
+|---|---|
+| DB (migration 014) | `daily_price_history` テーブル追加。UNIQUE(ticker, trading_date) / INDEX(ticker, trading_date DESC) |
+| `DailyPriceHistory` モデル | SQLAlchemy モデル。OHLCV + source + created_at |
+| `DailyPriceRow` dataclass | ORM から計算層を切り離すための内部型 |
+| `DailyMetricsRepository` | DB から直近 N 行を trading_date DESC で取得。DailyPriceRow リストに変換して返す |
+| `DailyMetricsComputer` | MA5 / MA20 / ATR14 / RSI14 を計算。stale / 行数不足は None |
+| `runner.py` 修正 | `_run_once()` 内で symbol_data 取得後・engine 実行前に `DailyMetricsComputer.enrich` を注入 |
+| `scripts/seed_daily_price.py` | J-Quants API から過去30取引日分を取得・upsert。`JQUANTS_EMAIL` / `JQUANTS_PASSWORD` 環境変数必要 |
+| テスト 30 件追加 | MA/ATR/RSI 計算・stale・Repository・Runner integration |
+
+### 計算定義（確定）
+
+| メトリクス | 計算式 | 必要行数 |
+|---|---|---|
+| ma5 | 直近5取引日 close 単純平均 | 5 |
+| ma20 | 直近20取引日 close 単純平均 | 20 |
+| atr | 14日 Wilder ATR（先頭TR = H-L、以降は prev_close 使用）| 14 |
+| rsi | 14期間 RSI（Wilder 初期値。avg_gain/avg_loss の単純平均）| 15（変化14本）|
+
+### Stale / 欠損ポリシー（確定）
+
+| ケース | 動作 |
+|---|---|
+| rows が空 | ma5=ma20=atr=rsi=None |
+| `rows[0].trading_date < today_jst - 4日` | ma5=ma20=atr=rsi=None（stale）|
+| 行数 < 必要数 | 該当メトリクスのみ None（他メトリクスは計算可能なら返す）|
+| high/low=None（ATR計算時）| atr=None |
+
+### 初期充填手順（Phase AT 完了後に実施）
+
+```bash
+# 1. migration 014 適用
+docker compose exec trade_app alembic upgrade head
+
+# 2. 初期充填（J-Quants API キー取得後）
+export JQUANTS_EMAIL="your@email.com"
+export JQUANTS_PASSWORD="yourpassword"
+export DATABASE_URL="postgresql+asyncpg://trade:trade_secret@localhost:5432/trade_db"
+export WATCHED_SYMBOLS="7203,6758"
+python scripts/seed_daily_price.py --days 30
+
+# 3. MarketStateRunner 起動（次サイクルから ma5/ma20/atr/rsi が注入される）
+docker compose up -d trade_app
+```
+
+### 変更ファイル一覧
+
+| ファイル | 変更内容 |
+|---|---|
+| `alembic/versions/014_daily_price_history.py` | **新規** daily_price_history テーブル |
+| `trade_app/models/daily_price_history.py` | **新規** SQLAlchemy モデル |
+| `trade_app/services/market_state/daily_metrics.py` | **新規** DailyMetricsRepository / DailyMetricsComputer / DailyPriceRow |
+| `trade_app/services/market_state/runner.py` | `_run_once()` に daily metrics enrich 注入・`_JST` タイムゾーン追加 |
+| `alembic/env.py` | daily_price_history モデル import 追加 |
+| `tests/conftest.py` | daily_price_history モデル import 追加 |
+| `scripts/seed_daily_price.py` | **新規** J-Quants 初期充填スクリプト |
+| `tests/test_phase_at.py` | **新規** 30件テスト |
+
+### 変更しなかったもの
+
+- `symbol_evaluator.py`（`data.get("ma5")` は実装済み）
+- `EvaluationContext` / `symbol_data` スキーマ
+- strategy seed / planning / guard / stage
+- broker adapter / Tachibana mapper
+
+### 次フェーズ
+
+**Phase AL 再実施条件**（demo limitation freeze の再開条件 B が部分充足）:
+- migration 014 適用済みであること ← Phase AT で実装済み
+- J-Quants API キー取得済みであること
+- `seed_daily_price.py` で 20 取引日分以上を投入済みであること
+- その後 Phase AL（market-hours manual entry smoke test）を再実施
+
+**次フェーズ候補**:
+1. J-Quants API キー取得 → seed_daily_price.py 実行 → migration 014 適用（インフラ作業）
+2. Phase AR-1: `pVWAP` / `pAV` mapper 追加（本フェーズとは独立）
+
+*最終更新: 2026-03-27 / Phase AT — daily_price_history テーブル + DailyMetricsComputer 実装 / テスト 1805 件全通過*
